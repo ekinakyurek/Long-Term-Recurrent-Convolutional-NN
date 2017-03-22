@@ -224,6 +224,7 @@ function train1(param, w, state, data; slen=100, lr=1.0, gclip=0.0)
         #input = ones(Float32, 1, 1000);
         @time gloss = lossgradient(param, state, input, sequence, ranges[t])
         println(t,". sentence trained")
+        println("loss in sentence: ", loss(param, state, input, sequence, ranges[t]))
         gscale = lr
         if gclip > 0
             gnorm = sqrt(mapreduce(sumabs2, +, 0, gloss))
@@ -346,10 +347,10 @@ function report_loss(param, w, state, data)
 
   for i=1:length(ranges)
     input_id = inputs[i]
-    #input = Main.VGG.data("./data/$input_id.jpg", zeros(Float32,224,224,3,1))
-    input = ones(Float32,224,224,3,1);
-    #input = cnn_predict(w, input)
-    input = ones(Float32, 1, 1000);
+    input = Main.VGG.data("./data/Flickr30k/flickr30k-images/$input_id.jpg", zeros(Float32,224,224,3,1))
+    #input = ones(Float32,224,224,3,1);
+    input = cnn_predict(w, input)
+    #input = ones(Float32, 1, 1000);
 
     for t in ranges[i]
         ypred = lrcn(param,state,input)
@@ -357,7 +358,6 @@ function report_loss(param, w, state, data)
         ygold = convert(atype, sequence[t])
         total += sum(ygold .* ynorm)
         count += size(ygold,1)
-        println(-total/count);
         #input = ygold
     end
 
