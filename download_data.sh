@@ -14,9 +14,9 @@ echo "Succesfully downloaded in to MsCoCo folder"
 echo "Downloading Flickr30k images and tokenized captions"
 mkdir Flickr30k
 wget http://shannon.cs.illinois.edu/DenotationGraph/data/flickr30k-images.tar
-tar -xf Flickr30k/flickr30k-images.tar
+tar -xf flickr30k-images.tar -C Flickr30k/
 rm flickr30k-images.tar
 wget http://shannon.cs.illinois.edu/DenotationGraph/data/flickr30k.tar.gz
-tar -xzf Flickr30k/flickr30k.tar.gz
+tar -xzf flickr30k.tar.gz -C Flickr30k/
 rm flickr30k.tar.gz
 echo "Succesfully downloaded in to Flickr30k folder"
