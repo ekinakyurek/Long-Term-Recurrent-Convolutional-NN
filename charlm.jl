@@ -2,6 +2,7 @@ for p in ("Knet","AutoGrad","ArgParse","Compat")
     Pkg.installed(p) == nothing && Pkg.add(p)
 end
 
+using Knet
 """
 charlm.jl: Knet8 version (c) Emre Yolcu, Deniz Yuret, 2016
 
@@ -32,7 +33,7 @@ Example usage:
   characters from the model in foo.jld.
 
 * `julia charlm.jl --help`: describes all available options.
-    
+
 """
 module CharLM
 
@@ -90,7 +91,7 @@ function main(args=ARGS)
         model = initweights(o[:atype], o[:hidden], length(vocab), o[:embed], o[:winit])
     else
         info("Loading model from $(o[:loadfile])")
-        vocab = load(o[:loadfile], "vocab") 
+        vocab = load(o[:loadfile], "vocab")
         for t in text, c in t; haskey(vocab, c) || error("Unknown char $c"); end
         model = map(p->convert(o[:atype],p), load(o[:loadfile], "model"))
     end
@@ -144,7 +145,7 @@ function train!(model, text, vocab, o)
         end
         devlast = devloss
     end
-end    
+end
 
 
 # sequence[t]: input token at time t
@@ -414,4 +415,3 @@ end  # module
 #   2.352389 seconds (2.34 M allocations: 239.381 MB, 1.51% gc time)
 #   6.211946 seconds (9.55 M allocations: 575.568 MB, 2.21% gc time)
 # (3,3.226540256084356)
-
