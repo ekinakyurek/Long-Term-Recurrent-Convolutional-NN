@@ -1,7 +1,13 @@
 # LRCN
 Long-termRecurrentNeuralNetworks
 
-julia lrcn.jl image-file-or-url
+To train(You mush have data folder in the repository):
+
+julia lrcn.jl --fast
+
+To generate:
+
+julia lrcn.jl img_path --generate 100
 
 This example implements the Long-term recurrent convolutional network model from
 
