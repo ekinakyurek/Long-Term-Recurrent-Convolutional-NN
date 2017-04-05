@@ -6,7 +6,6 @@ using Knet
 !isdefined(:VGG) && include(Knet.dir("examples","vgg.jl"))
 !isdefined(:Tokenizer) && include("./tokenizer.jl")
 
-
 """
 julia lrcn.jl image-file-or-url
 
@@ -20,15 +19,15 @@ Proceedings of the IEEE conference on computer vision and pattern recognition. 2
 """
 module LRCN
 
-using Knet, AutoGrad, ArgParse,Compat, MAT, Images;
-
-#using Main.VGG: data, imgurl;
+using Knet, AutoGrad, ArgParse, Compat, MAT, Images;
 
 using Tokenizer;
-
+const vggurl = "http://www.vlfeat.org/matconvnet/models/imagenet-vgg-verydeep-16.mat"
 const imgurl = "https://github.com/BVLC/caffe/raw/master/examples/images/cat.jpg"
+const LAYER_TYPES = ["conv", "relu", "pool", "fc", "prob"]
 const Flickr30k_captions = "data/Flickr30k/results_20130124.token"
-const eos = "~~"
+global averageImage = nothing;
+
 function main(args=ARGS)
     s = ArgParseSettings()
 
@@ -36,6 +35,7 @@ function main(args=ARGS)
 
     @add_arg_table s begin
         ("image"; default=imgurl; help="Image file or URL.")
+        ("--model"; default=Knet.dir("data","imagenet-vgg-verydeep-16.mat"); help="Location of the model file")
         ("--datafiles"; nargs='+'; help="If provided, use first file for training, second for dev, others for test.")
         ("--loadfile"; help="Initialize model from file")
         ("--savefile"; help="Save final model to file")
@@ -43,13 +43,14 @@ function main(args=ARGS)
         ("--generate"; arg_type=Int; default=0; help="If non-zero generate given number of characters.")
         ("--hidden"; nargs='+'; arg_type=Int; default=[1000]; help="Sizes of one or more LSTM layers.")
         ("--embed"; arg_type=Int; default=1000; help="Size of the embedding vector.")
+        ("--cnnout"; arg_type=Int; default=4096; help="Size of the cnn visual output vector.");
         ("--epochs"; arg_type=Int; default=20; help="Number of epochs for training.")
         ("--batchsize"; arg_type=Int; default=20; help="Number of sequences to train on in parallel.")
         ("--seqlength"; arg_type=Int; default=100; help="Number of steps to unroll the network for.")
         ("--decay"; arg_type=Float64; default=0.9; help="Learning rate decay.")
-        ("--lr"; arg_type=Float64; default=4.0; help="Initial learning rate.")
-        ("--gclip"; arg_type=Float64; default=3.0; help="Value to clip the gradient norm at.")
-        ("--winit"; arg_type=Float64; default=0.3; help="Initial weights set to winit*randn().")
+        ("--lr"; arg_type=Float64; default=2.0; help="Initial learning rate.")
+        ("--gclip"; arg_type=Float64; default=5.0; help="Value to clip the gradient norm at.")
+        ("--winit"; arg_type=Float64; default=0.08; help="Initial weights set to winit*randn().")
         ("--gcheck"; arg_type=Int; default=0; help="Check N random gradients.")
         ("--seed"; arg_type=Int; default=-1; help="Random number seed.")
         ("--atype"; default=(gpu()>=0 ? "KnetArray{Float32}" : "Array{Float32}"); help="array type: Array for cpu, KnetArray for gpu")
@@ -70,6 +71,9 @@ function main(args=ARGS)
         eval(Expr(:using,:JLD))
     end
 
+    a = KnetArray(Float32,2,2) * KnetArray(Float32,2,2); #To initialize cudablas
+
+
     # we initialize a model from loadfile, train using datafiles (both optional).
     # if the user specifies neither, train a model using the charlm.jl source code.
     isempty(o[:datafiles]) && o[:loadfile]==nothing && push!(o[:datafiles],Flickr30k_captions) # Flickr30k
@@ -88,20 +92,34 @@ function main(args=ARGS)
 
         println("Tokenization starts")
         #vocab = {"words1"=>1,"words2"=>2, ....}
-        vocab = Dict{String, Int}()
+        global vocab = Dict{String, Int}()
         #captions_dicts = [((id1, ["word1","word2",...]),length1),((id2, ["word1","word2",...]),length2),...]
         caption_dicts = Array{Array{Tuple{Tuple{Int64,Array{String,1}},Int64},1},1}();
         Tokenizer.tokenize(vocab, caption_dicts;data_files=o[:datafiles])
-        get!(vocab,eos,1+length(vocab)); #eos
+        get!(vocab,"~",1+length(vocab)); #eos
+        get!(vocab,"`",1+length(vocab)); #bos
+
+
         info("Tokenization finished with captions size: $(sizeof(caption_dicts))")
 
         println("Intializing cnn_weights")
-        w = cnn_weights(o[:embed];atype=o[:atype]);
-        info("Cnn is initialized with size : $(sizeof(w))")
 
-        println("Intializing LSTM weigths")
-        model = initweights(o[:atype], o[:hidden], length(vocab), o[:embed], o[:winit])
-        info("LSTM is initialized with size : $(sizeof(model))")
+          if !isfile(o[:model])
+              println("Should I download the VGG model (492MB)? Enter 'y' to download, anything else to quit.")
+              readline() == "y\n" || return
+              download(vggurl,o[:model])
+          end
+
+         info("Reading $(o[:model])")
+         vgg = matread(o[:model])
+         params = get_params_cnn(vgg)
+         convnet = get_convnet(params...)
+         global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
+         info("Cnn is initialized")
+
+         println("Intializing LSTM weigths")
+         model = initweights(o[:atype], o[:hidden], length(vocab), o[:embed], o[:cnnout],o[:winit])
+         info("LSTM is initialized with size : $(size(model))")
     else
         # info("Loading model from $(o[:loadfile])")
         # vocab = load(o[:loadfile], "vocab")
@@ -116,12 +134,20 @@ function main(args=ARGS)
     #img = data(o[:image], zeros(Float32,224,224,3,1))
 
 
+
     if o[:generate] > 0
         println("Generation starts")
         state = initstate(o[:atype],o[:hidden],1)
-        img = data(o[:image], zeros(Float32,224,224,3,1))
+        img = read_image_data(o[:image], averageImage)
+        global eos = falses(1, length(vocab))
+        eos[:,end-1] = 1;
+        global eos = convert(KnetArray{Float32},eos);
+
+        global bos = falses(1, length(vocab))
+        bos[:,end] = 1;
+        global bos = convert(KnetArray{Float32},bos);
         #image = ones(224,224,3,1);
-        generate(model, w, state, img, vocab, o[:generate])
+        generate(model, convnet, state, img, vocab, o[:generate])
         println("Generation finished")
     end
 
@@ -134,9 +160,9 @@ function main(args=ARGS)
       # println()
       sequence = map(t->minibatch(t, vocab, o[:batchsize]), caption_dicts)
       #no need to caption dicts any more delete it from memory
-      caption_dicts = 0; gc();
+      caption_dicts = 0; gc(); Knet.knetgc();
       println("Data is created with size: $(sizeof(sequence))")
-      train!(model,w, sequence, vocab, o)
+      train!(model,convnet, sequence, vocab, o)
     end
 
     if o[:savefile] != nothing
@@ -146,22 +172,22 @@ function main(args=ARGS)
 
 end
 
-function train!(model, w, sequence, vocab, o)
+function train!(model, convnet, sequence, vocab, o)
     s0 = initstate(o[:atype], o[:hidden], o[:batchsize])
     lr = o[:lr]
     if o[:fast]
         @time (for epoch=1:o[:epochs]
-               train1(model,w, copy(s0), sequence[1]; batch_size=o[:batchsize], lr=lr, gclip=o[:gclip])
+               train1(model, convnet, copy(s0), sequence[1]; batch_size=o[:batchsize], lr=lr, gclip=o[:gclip], cnnout=o[:cnnout])
                end; gpu()>=0 && Knet.cudaDeviceSynchronize())
         return
     end
-    losses = map(d->report_loss(model, w, copy(s0),d, o[:batchsize]), sequence)
+    losses = map(d->report_loss(model, convnet, copy(s0), d ; batch_size=o[:batchsize], cnnout=o[:cnnout]), sequence)
     println((:epoch,0,:loss,losses...))
     devset = ifelse(length(data) > 1, 2, 1)
     devlast = devbest = losses[devset]
     for epoch=1:o[:epochs]
         @time train1(model, copy(s0), sequence[1]; slen=o[:seqlength], lr=lr, gclip=o[:gclip])
-        @time losses = map(d->report_loss(model, w,copy(s0),d), data)
+        @time losses = map(d->report_loss(model, convnet, copy(s0),d ; batch_size=o[:batchsize], cnnout=o[:cnnout]), sequence)
         println((:epoch,epoch,:loss,losses...))
         if o[:gcheck] > 0
             gradcheck(loss, model, copy(s0), sequence[1], 1:o[:seqlength]; gcheck=o[:gcheck])
@@ -231,7 +257,7 @@ function minibatch(caption_dict, word_to_index, batch_size)
     println("Unbatchable captions is deleted: $(length(caption_dict))")
 
     #length for one caption  1+caption[i][2] because of eos
-    lengths = map(t->(t[2]+1), caption_dict)
+    lengths = map(t->t[2], caption_dict)
     #total word count
     nbatch = div(sum(lengths), batch_size)
 
@@ -242,15 +268,22 @@ function minibatch(caption_dict, word_to_index, batch_size)
 
     index = 1; l = 1; input_index = 1;
 
+    global eos = falses(batch_size, length(word_to_index))
+    eos[:,end-1] = 1;
+    global eos = convert(KnetArray{Float32},eos);
+
+    global bos = falses(batch_size, length(word_to_index))
+    bos[:,end] = 1;
+    global bos = convert(KnetArray{Float32},bos);
+
     for i=1:batch_size:length(lengths)
         l = lengths[i]
         for j=i:i+batch_size-1
           (id,words), _ = caption_dict[j]
           input_ids[input_index][j-i+1] = id
-          for k=index:index+l-2
+          for k=index:index+l-1
              sequence[k][j-i+1, word_to_index[words[k-index+1]]] = 1
           end
-          sequence[index+l-1][j-i+1,end] = 1
         end
         index = index+l;
         input_index += 1;
@@ -261,27 +294,58 @@ function minibatch(caption_dict, word_to_index, batch_size)
 end
 
 function read_image_data(img, averageImage)
-    if contains(img,"://")
-        info("Downloading $img")
-        img = download(img)
-    end
-    a0 = load(img)
-    new_size = ntuple(i->div(size(a0,i)*224,minimum(size(a0))),2)
-    a1 = Images.imresize(a0, new_size)
-    i1 = div(size(a1,1)-224,2)
-    j1 = div(size(a1,2)-224,2)
-    b1 = a1[i1+1:i1+224,j1+1:j1+224]
-    c1 = permutedims(channelview(b1), (3,2,1))
-    d1 = convert(Array{Float32}, c1)
-    e1 = reshape(d1[:,:,1:3], (224,224,3,1))
-    f1 = (255 * e1 .- averageImage)
-    g1 = permutedims(f1, [2,1,3,4])
-    x1 = KnetArray(g1)
+      if contains(img,"://")
+          info("Downloading $img")
+          img = download(img)
+      end
+      a0 = load(img)
+      new_size = ntuple(i->div(size(a0,i)*224,minimum(size(a0))),2)
+      a1 = Images.imresize(a0, new_size)
+      i1 = div(size(a1,1)-224,2)
+      j1 = div(size(a1,2)-224,2)
+      b1 = a1[i1+1:i1+224,j1+1:j1+224]
+      c1 = permutedims(channelview(b1), (3,2,1))
+      d1 = convert(Array{Float32}, c1)
+      e1 = reshape(d1[:,:,1:3], (224,224,3,1))
+      f1 = (255 * e1 .- averageImage)
+      g1 = permutedims(f1, [2,1,3,4])
+      x1 = KnetArray(g1)
 end
 
 # sequence[t]: input token at time t
 # state is modified in place
-function train1(param, w, state, seq; batch_size=20, lr=1.0, gclip=0.0)
+
+function complete_karpathy_features(param, convnet, state, seq; batch_size=20, lr=1.0, gclip=0.0)
+  sequence = seq[1]
+  input_ids = seq[2]
+  lengths = seq[3]
+  index = 1; l=1; input_index = 1;
+  count = 0;
+  for t = 1:batch_size:length(lengths)
+         l = lengths[t]
+         for i=1:batch_size
+               id = input_ids[input_index][i]
+               filename = "./data/Flickr30k/karpathy/features/$id.jld";
+               if isfile(filename)
+
+
+               else
+                println(id)
+                image = read_image_data("./data/Flickr30k/flickr30k-images/$id.jpg", averageImage)
+                image = convnet(image);
+                image = convert(Array{Float32},image);
+                save(filename, "feature", image)
+                count += 1;
+               end
+         end
+         index = index +l;
+         input_index += 1
+  end
+  return count;
+end
+
+function train1(param, convnet, state, seq; batch_size=20, lr=1.0, gclip=0.0, cnnout=4096)
+   #complete_karpathy_features(param, convnet, state, seq; batch_size=batch_size, lr=lr, gclip=gclip)
    sequence = seq[1]
    input_ids = seq[2]
    lengths = seq[3]
@@ -293,25 +357,33 @@ function train1(param, w, state, seq; batch_size=20, lr=1.0, gclip=0.0)
         l = lengths[t]
         #input_ids = inputs_ids[index:index+l-1]
         #println(input_id)
-
-        input = KnetArray(Float32,224,224,3,batch_size);
-
+        input = Array(Float32, batch_size, cnnout);
         for i=1:batch_size
               id = input_ids[input_index][i]
-              start_index = 1;
-              end_index = 150528;
-              if i != 1
-                  start_index = sub2ind((224,224,3,batch_size),224,224,3,i-1) + 1
-                  end_index = start_index + 150528 - 1;
+              filename = "./data/Flickr30k/karpathy/features/$id.jld";
+              if isfile(filename)
+                input[i,:] = load(filename, "feature");
+              else
+                println(id,"not found in karpathy features")
+                image = read_image_data("./data/Flickr30k/flickr30k-images/$id.jpg", averageImage)
+                image = convnet(image);
+                image= convert(Array{Float32},image);
+                save(filename, "feature", image)
+                input[i,:] = image;
               end
-              input[start_index:end_index] = read_image_data("./data/Flickr30k/flickr30k-images/$id.jpg", zeros(Float32,224,224,3,1))
         end
 
-        input = cnn_predict(w, input)
-        #inputs = ones(Float32, batch_size, 1000);
+        input = convert(KnetArray{Float32},input);
+        #input = cnn_predict(convnet, input)
+        #input = ones(Float32, batch_size, 1000);
         gloss = lossgradient(param, state, input, sequence, index:index+l-1)
-        println(t,". sentence trained")
-        #println("loss in sentence: ", loss(param, state, inputs, sequence, ranges[t]))
+
+        if t%1000 == 1
+          println(t,". sentence trained")
+          println("loss in sentence: ", loss(param, state, input, sequence, index:index+l-1))
+          Knet.knetgc();gc();
+        end
+
         gscale = lr
         if gclip > 0
             gnorm = sqrt(mapreduce(sumabs2, +, 0, gloss))
@@ -319,23 +391,81 @@ function train1(param, w, state, seq; batch_size=20, lr=1.0, gclip=0.0)
                 gscale *= gclip / gnorm
             end
         end
+
         for k in 1:length(param)
             # param[k] -= gscale * gloss[k]
             axpy!(-gscale, gloss[k], param[k])
         end
+
         isa(state,Vector{Any}) || error("State should not be Boxed.")
         # The following is needed in case AutoGrad boxes state values during gradient calculation
         for i = 1:length(state)
             state[i] = AutoGrad.getval(state[i])
         end
-        index = index +l-1;
+
+        index = index +l;
         input_index += 1
     end
 end
 
+function report_loss(param, convnet, state, seq; batch_size=20, cnnout=4096)
+
+  total = 0.0; count = 0
+  atype = typeof(AutoGrad.getval(param[1]))
+  sequence = seq[1]
+  input_ids = seq[2]
+  lengths = seq[3]
+
+  index = 1; l=1; input_index = 1;
+
+  for t = 1:batch_size:length(lengths)
+    l = lengths[t]
+
+    input = Array(Float32,batch_size,cnnout);
+
+    for i=1:batch_size
+          id = input_ids[input_index][i]
+          filename = "./data/Flickr30k/karpathy/features/$id.jld";
+          if isfile(filename)
+            input[i,:] = load(filename, "feature");
+          else
+            println(id,"not found in karpathy features")
+            image = read_image_data("./data/Flickr30k/flickr30k-images/$id.jpg", averageImage)
+            image = convnet(image);
+            input[i,:] = convert(Array{Float32},image);
+          end
+    end
+
+    #input = ones(Float32,224,224,3,1);
+    #input = cnn_predict(convnet, input)
+    input = convert(atype,input)
+    lstm_input = bos;
+    #input = ones(Float32, 1, 1000);
+
+    for c in index:index+l-1
+        ypred = lrcn(param,state,input,lstm_input)
+        ynorm = logp(ypred,2) # ypred .- log(sum(exp(ypred),2))
+        ygold = convert(atype, sequence[c])
+        total += sum(ygold .* ynorm)
+        count += size(ygold,1)
+        lstm_input = ygold
+    end
+
+    ypred = lrcn(param,state,input,lstm_input)
+    ynorm = logp(ypred,2) # ypred .- log(sum(exp(ypred),2))
+    ygold = eos
+    total += sum(ygold .* ynorm)
+    count += size(ygold,1)
+
+    index = index + l;
+    input_index += 1;
+  end
+  return -total / count
+end
 
 
-function initweights(atype, hidden, vocab, embed, winit)
+
+function initweights(atype, hidden, vocab, embed, cnnout, winit)
     param = Array(Any, 2*length(hidden)+3)
     input = embed
     for k = 1:length(hidden)
@@ -344,7 +474,7 @@ function initweights(atype, hidden, vocab, embed, winit)
         param[2k][1:hidden[k]] = 1 # forget gate bias
         input = hidden[k]
     end
-    param[end-2] = winit*randn(embed,embed)
+    param[end-2] = winit*randn(cnnout+vocab,embed)
     param[end-1] = winit*randn(hidden[end],vocab)
     param[end] = zeros(1,vocab)
     return map(p->convert(atype,p), param)
@@ -372,8 +502,8 @@ function lstm(weight,bias,hidden,cell,input)
     return (hidden,cell)
 end
 
-function lrcn(w,s,x)
-  x = x * w[end-2]
+function lrcn(w,s, x_cnn, x_lstm)
+  x = hcat(x_cnn,x_lstm) * w[end-2]
   for i = 1:2:length(s)
       (s[i],s[i+1]) = lstm(w[i],w[i+1],s[i],s[i+1],x)
       x = s[i]
@@ -382,33 +512,42 @@ function lrcn(w,s,x)
 end
 
 
-
 function loss(param,state,input,sequence,range)
     total = 0.0; count = 0
     atype = typeof(AutoGrad.getval(param[1]))
-    input = convert(atype,input)
+    lstm_input = bos;
     for t in range
-        ypred = lrcn(param,state,input)
+        ypred = lrcn(param,state,input,lstm_input)
         ynorm = logp(ypred,2) # ypred .- log(sum(exp(ypred),2))
         ygold = convert(atype, sequence[t])
         total += sum(ygold .* ynorm)
         count += size(ygold,1)
-        #input = ygold
+        lstm_input = ygold
     end
+
+    ypred = lrcn(param,state,input,lstm_input)
+    ynorm = logp(ypred,2) # ypred .- log(sum(exp(ypred),2))
+    ygold = eos;
+    total += sum(ygold .* ynorm)
+    count += size(ygold,1)
+
     return -total / count
 end
 
+lossgradient = grad(loss);
 
-function generate(param, w,  state, input, vocab, nword)
+function generate(param, convnet,  state, input, vocab, nword)
     index_to_char = Array(String, length(vocab))
     for (k,v) in vocab; index_to_char[v] = k; end
-    input = cnn_predict(w, input)
-    #input = ones(1,1000);
+    input = convnet(input);
     index = 1
     println("Generating Starts");
+    lstm_input = bos;
     for i=1:nword
-        ypred = lrcn(param,state,input)
-        index = sample(exp(logp(ypred)))
+        ypred = lrcn(param,state,input,lstm_input)
+        ynorm = logp(ypred);
+        lstm_input = (ynorm .== maximum(ynorm)) .* ynorm;
+        index = sample(exp(ynorm));
         if index == length(vocab)
           #eos
           break;
@@ -428,154 +567,65 @@ function sample(p)
     end
 end
 
-function report_loss(param, w, state, seq, batch_size)
-  total = 0.0; count = 0
-  atype = typeof(AutoGrad.getval(param[1]))
 
-  sequence = seq[1]
-  input_ids = seq[2]
-  lengths = seq[3]
 
-  index = 1; l=1; input_index = 1;
+#CNN Parameters from VLFEAT VGG.NET
+function get_params_cnn(CNN; last_layer="fc7")
+    layers = CNN["layers"]
+    weights, operations, derivatives = [], [], []
 
-  for t = 1:batch_size:length(lengths)
-    l = lengths[t]
+    for l in layers
+        get_layer_type(x) = startswith(l["name"], x)
+        operation = filter(x -> get_layer_type(x), LAYER_TYPES)[1]
+        push!(operations, operation)
+        push!(derivatives, haskey(l, "weights") && length(l["weights"]) != 0)
 
-    input = KnetArray(Float32,224,224,3,batch_size);
-
-    for i=1:batch_size
-          id = input_ids[input_index][i]
-          start_index = 1;
-          end_index = 150528;
-          if i != 1
-              start_index = sub2ind((224,224,3,batch_size),224,224,3,i-1) + 1
-              end_index = start_index + 150528 - 1;
-          end
-          input[start_index:end_index] = read_image_data("./data/Flickr30k/flickr30k-images/$id.jpg", zeros(Float32,224,224,3,1))
-    end
-
-    #input = ones(Float32,224,224,3,1);
-    input = cnn_predict(w, input)
-    #input = ones(Float32, 1, 1000);
-
-    for c in index:index+l-1
-        ypred = lrcn(param,state,input)
-        ynorm = logp(ypred,2) # ypred .- log(sum(exp(ypred),2))
-        ygold = convert(atype, sequence[c])
-        total += sum(ygold .* ynorm)
-        count += size(ygold,1)
-        #input = ygold
-    end
-
-    println("after",t,". batch loss is equal :", -total/count)
-
-    index = index+l-1;
-    input_index += 1;
-
-  end
-  return -total / count
-end
-
-lossgradient = grad(loss);
-
-function train(w, data; lr=.1, epochs=20, nxy=0)
-    for epoch=1:epochs
-        for (x,y) in data
-            g = lossgradient(w, x, y)
-            for i in 1:length(w)
-                # w[i] -= lr * g[i]
-                axpy!(-lr, g[i], w[i])
+        if derivatives[end]
+            w = l["weights"]
+            if operation == "conv"
+                w[2] = reshape(w[2], (1,1,length(w[2]),1))
+            elseif operation == "fc"
+                w[1] = transpose(mat(w[1]))
             end
+            push!(weights, w)
         end
-    end
-    return w
-end
 
-function batchnorm(w, x, ms; mode=1, epsilon=1e-5)
-    mu, sigma = nothing, nothing
-    if mode == 0
-        d = ndims(x) == 4 ? (1,2,4) : (2,)
-        s = reduce((a,b)->a*size(x,b), d)
-        mu = sum(x,d) / s
-        sigma = sqrt(epsilon + (sum(x.-mu,d).^2) / s)
-    elseif mode == 1
-        mu = shift!(ms)
-        sigma = shift!(ms)
+        last_layer != nothing && get_layer_type(last_layer) && break
     end
 
-    # we need getval in backpropagation
-    push!(ms, AutoGrad.getval(mu), AutoGrad.getval(sigma))
-    xhat = (x.-mu) ./ sigma
-    return w[1] .* xhat .+ w[2]
+    map(w -> map(KnetArray, w), weights), operations, derivatives
 end
 
-function get_params(params)
-    len = length(params["value"])
-    ws, ms = [], []
-    for k = 1:len
-        name = params["name"][k]
-        value = convert(Array{Float32}, params["value"][k])
-        if endswith(name, "moments")
-            push!(ms, reshape(value[:,1], (1,1,size(value,1),1)))
-            push!(ms, reshape(value[:,2], (1,1,size(value,1),1)))
-        elseif startswith(name, "bn")
-            push!(ws, reshape(value, (1,1,length(value),1)))
-        elseif startswith(name, "fc") && endswith(name, "filter")
-            push!(ws, transpose(reshape(value,size(value,3,4))))
-        elseif startswith(name, "conv") && endswith(name, "bias")
-            push!(ws, reshape(value, (1,1,length(value),1)))
-        else
-            push!(ws, value)
+# convolutional network operations
+convx(x,w)=conv4(w[1], x; padding=1, mode=1) .+ w[2]
+relux = relu
+poolx = pool
+probx(x) = x
+fcx(x,w) = w[1]*mat(x) .+ w[2];
+tofunc(op) = eval(parse(string(op, "x")))
+forw(x,op) = tofunc(op)(x)
+forw(x,op,w) = tofunc(op)(x,w)
+
+function get_convnet(weights, operations, derivatives)
+    function convnet(xs)
+        i, j = 1, 1
+        num_weights, num_operations = length(weights), length(operations)
+        while i <= num_operations && j <= num_weights
+            if derivatives[i]
+                xs = forw(xs, operations[i], weights[j])
+                j += 1
+            else
+                xs = forw(xs, operations[i])
+            end
+            i += 1
         end
+        return transpose(xs);
     end
-    map(KnetArray, ws), map(KnetArray, ms)
 end
 
-function cnn_loss(w,x,ygold)
-    ypred = lrcn(w,x)
-    ynorm = logp(ypred,1)  # ypred .- log(sum(exp(ypred),1))
-    -sum(ygold .* ynorm) / size(ygold,2)
-end
-
-function cnn_predict(w,x; embed = 1000)
-  x = pool(relu(conv4(w[1],x;padding=2) .+ w[2]); window=2, stride=2);
-  x = pool(relu(conv4(w[3],x;padding=2) .+ w[4]); window=2, stride=2);
-  x = pool(relu(conv4(w[5],x;padding=2) .+ w[6]); window=2, stride=2);
-  x = pool(relu(conv4(w[7],x;padding=2) .+ w[8]); window=2, stride=2);
-  #println(size(x))
-  #DBG Change reshape to make it row vector not column since it goes to LSTM eventually
-  x = reshape(x,(size(x,4),14*14*10));
-  x = tanh(x*w[9] .+ w[10]);
-  return x;
-end
-
-function cnn_weights(embed; atype=KnetArray{Float32}, winit=0.1)
-  w = Array(Any, 10)
-  w[1] = randn(Float32,5,5,3,10)*winit; w[2] = zeros(Float32,1,1,10,1);
-  w[3] = randn(Float32,5,5,10,10)*winit; w[4] = zeros(Float32,1,1,10,1);
-  w[5] = randn(Float32,5,5,10,10)*winit; w[6] = zeros(Float32,1,1,10,1);
-  w[7] = randn(Float32,5,5,10,10)*winit; w[8] = zeros(Float32,1,1,10,1);
-  w[9] = randn(Float32,14*14*10, embed)*winit; w[10] = zeros(Float32,1,embed);
-  return map(a->convert(atype,a), w);
-end
-
-function xavier(a...)
-    w = rand(a...)
-     # The old implementation was not right for fully connected layers:
-     # (fanin = length(y) / (size(y)[end]); scale = sqrt(3 / fanin); axpb!(rand!(y); a=2*scale, b=-scale)) :
-    if ndims(w) < 2
-        error("ndims=$(ndims(w)) in xavier")
-    elseif ndims(w) == 2
-        fanout = size(w,1)
-        fanin = size(w,2)
-    else
-        fanout = size(w, ndims(w)) # Caffe disagrees: http://caffe.berkeleyvision.org/doxygen/classcaffe_1_1XavierFiller.html#details
-        fanin = div(length(w), fanout)
-    end
-    # See: http://jmlr.org/proceedings/papers/v9/glorot10a/glorot10a.pdf
-    s = sqrt(2 / (fanin + fanout))
-    w = 2s*w-s
-end
+function cnn_predict(convnet,x)
+   return convnet(x);
+ end
 
 # To be able to load/save KnetArrays:
 if Pkg.installed("JLD") != nothing
