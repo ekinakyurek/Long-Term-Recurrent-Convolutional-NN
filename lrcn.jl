@@ -22,6 +22,8 @@ module LRCN
 using Knet, AutoGrad, ArgParse, Compat, MAT, Images;
 
 using Tokenizer;
+
+
 const vggurl = "http://www.vlfeat.org/matconvnet/models/imagenet-vgg-verydeep-16.mat"
 const imgurl = "https://github.com/BVLC/caffe/raw/master/examples/images/cat.jpg"
 const LAYER_TYPES = ["conv", "relu", "pool", "fc", "prob"]
@@ -45,6 +47,7 @@ function main(args=ARGS)
         ("--embed"; arg_type=Int; default=1000; help="Size of the embedding vector.")
         ("--cnnout"; arg_type=Int; default=4096; help="Size of the cnn visual output vector.");
         ("--epochs"; arg_type=Int; default=20; help="Number of epochs for training.")
+        ("--recall"; arg_type=Int; default=5; help="Number of tries for caption generation.")
         ("--batchsize"; arg_type=Int; default=20; help="Number of sequences to train on in parallel.")
         ("--seqlength"; arg_type=Int; default=100; help="Number of steps to unroll the network for.")
         ("--decay"; arg_type=Float64; default=0.9; help="Learning rate decay.")
@@ -73,96 +76,82 @@ function main(args=ARGS)
 
     a = KnetArray(Float32,2,2) * KnetArray(Float32,2,2); #To initialize cudablas
 
-
-    # we initialize a model from loadfile, train using datafiles (both optional).
-    # if the user specifies neither, train a model using the charlm.jl source code.
     isempty(o[:datafiles]) && o[:loadfile]==nothing && push!(o[:datafiles],Flickr30k_captions) # Flickr30k
 
-    # read text and create global vocab variable
-
-    #text = map((@compat readstring), o[:datafiles])
-    #!isempty(text) && info("Chars read: $(map((f,c)->(basename(f),length(c)),o[:datafiles],text))")
-
-    #gpu() >= 0 || error("LRCN only works on GPU machines.")
-
-    #println(o[:hidden])
-    # vocab (char_to_index) comes from the initial model if there is one, otherwise from the datafiles.
-    # if there is an initial model make sure the data has no new vocab
     if o[:loadfile]==nothing
+      println("Tokenization starts")
+      #vocab = {"words1"=>1,"words2"=>2, ....}
+      global vocab = Dict{String, Int}()
+      #captions_dicts = [((id1, ["word1","word2",...]),length1),((id2, ["word1","word2",...]),length2),...]
+      caption_dicts = Array{Array{Tuple{Tuple{Int64,Array{String,1}},Int64},1},1}()
+      Tokenizer.tokenize(vocab, caption_dicts; data_files=o[:datafiles])
+      get!(vocab,"~",1+length(vocab)) #eos
+      get!(vocab,"``",1+length(vocab)) #bos
+      info("Tokenization finished with captions")
 
-        println("Tokenization starts")
-        #vocab = {"words1"=>1,"words2"=>2, ....}
-        global vocab = Dict{String, Int}()
-        #captions_dicts = [((id1, ["word1","word2",...]),length1),((id2, ["word1","word2",...]),length2),...]
-        caption_dicts = Array{Array{Tuple{Tuple{Int64,Array{String,1}},Int64},1},1}();
-        Tokenizer.tokenize(vocab, caption_dicts;data_files=o[:datafiles])
-        get!(vocab,"~",1+length(vocab)); #eos
-        get!(vocab,"`",1+length(vocab)); #bos
+      println("Intializing cnn_weights")
+      if !isfile(o[:model])
+       println("Should I download the VGG model (492MB)? Enter 'y' to download, anything else to quit.")
+       readline() == "y\n" || return
+       download(vggurl,o[:model])
+      end
+      info("Reading $(o[:model])");
+      vgg = matread(o[:model]);
+      params = get_params_cnn(vgg)
+      convnet = get_convnet(params...);
+      global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
+      info("Cnn is initialized")
 
 
-        info("Tokenization finished with captions size: $(sizeof(caption_dicts))")
-
-        println("Intializing cnn_weights")
-
-          if !isfile(o[:model])
-              println("Should I download the VGG model (492MB)? Enter 'y' to download, anything else to quit.")
-              readline() == "y\n" || return
-              download(vggurl,o[:model])
-          end
-
-         info("Reading $(o[:model])")
-         vgg = matread(o[:model])
-         params = get_params_cnn(vgg)
-         convnet = get_convnet(params...)
-         global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
-         info("Cnn is initialized")
-
-         println("Intializing LSTM weigths")
-         model = initweights(o[:atype], o[:hidden], length(vocab), o[:embed], o[:cnnout],o[:winit])
-         info("LSTM is initialized with size : $(size(model))")
+      println("Intializing LSTM weigths")
+      model = initweights(o[:atype], o[:hidden], length(vocab), o[:embed], o[:cnnout], o[:winit])
+      optim = initparams(model);
+      info("LSTM is initialized")
     else
-        # info("Loading model from $(o[:loadfile])")
-        # vocab = load(o[:loadfile], "vocab")
-        # for t in text, c in t; haskey(vocab, c) || error("Unknown char $c"); end
-        # model = map(p->convert(o[:atype],p), load(o[:loadfile], "model"))
+      info("Loading model from $(o[:loadfile])")
+      vocab = load(o[:loadfile], "vocab")
+      model = map(p->convert(o[:atype],p), load(o[:loadfile], "model"))
     end
 
-    info("$(length(vocab)) unique words with size: $(sizeof(vocab))")
-
-
-    #  info("Reading $(o[:image])")
-    #img = data(o[:image], zeros(Float32,224,224,3,1))
-
-
+    info("$(length(vocab)) unique words")
 
     if o[:generate] > 0
         println("Generation starts")
-        state = initstate(o[:atype],o[:hidden],1)
+        state = initstate(model,1)
         img = read_image_data(o[:image], averageImage)
-        global eos = falses(1, length(vocab))
-        eos[:,end-1] = 1;
-        global eos = convert(KnetArray{Float32},eos);
-
-        global bos = falses(1, length(vocab))
-        bos[:,end] = 1;
-        global bos = convert(KnetArray{Float32},bos);
-        #image = ones(224,224,3,1);
+        #initialize eos and bos with batchsize 1;
+        initeosbos(1;atype=o[:atype]);
+        #Generate captions for given image
         generate(model, convnet, state, img, vocab, o[:generate])
         println("Generation finished")
+
     end
 
+
     if !isempty(caption_dicts)
-      #y1 = cnn_predict(w,img)
-      # z1 = vec(Array(y1))
-      # s1 = sortperm(z1,rev=true)
-      # p1 = exp(logp(z1))
-      # display(hcat(p1[s1[1:o[:top]]], description[s1[1:o[:top]]]))
-      # println()
+      #init eos and bos with given batchsize
+      initeosbos(o[:batchsize]);
+      #get word sequences for caption datasets;
       sequence = map(t->minibatch(t, vocab, o[:batchsize]), caption_dicts)
-      #no need to caption dicts any more delete it from memory
+      #no need to caption dicts any more delete it from memory. Call garbage collectors
       caption_dicts = 0; gc(); Knet.knetgc();
-      println("Data is created with size: $(sizeof(sequence))")
-      train!(model,convnet, sequence, vocab, o)
+      println("Data is created")
+      println("Training starts:....")
+      train!(model, optim ,convnet, sequence, vocab, o)
+      println("Generating after training......")
+      for i=1:o[:recall]
+        state = initstate(model, 1);
+        #Flickr dataset image id for first bath first element.
+        id = sequence[1][2][1][1]
+        println(id,": ",i, ".","try ");
+        image = read_image_data("./data/Flickr30k/flickr30k-images/$id.jpg", averageImage)
+        #Initialize eos and bos with batchsize 1
+        initeosbos(1);
+        #Generate from id of image in Flickr30k database
+        generate2(model,id,state,vocab,o[:generate]);
+        #generate(model, convnet, state, image, vocab, o[:generate])
+      end
+      println("Generation finished")
     end
 
     if o[:savefile] != nothing
@@ -172,40 +161,28 @@ function main(args=ARGS)
 
 end
 
-function train!(model, convnet, sequence, vocab, o)
-    s0 = initstate(o[:atype], o[:hidden], o[:batchsize])
+
+function initeosbos(batch_size;atype=KnetArray{Float32})
+  global eos = falses(batch_size, length(vocab))
+  eos[:,end-1] = 1;
+  global eos = convert(atype,eos);
+  global bos = falses(batch_size, length(vocab))
+  bos[:,end] = 1;
+  global bos = convert(atype,bos);
+end
+
+
+function train!(model, optim, convnet, sequence, vocab, o)
+    s0 = initstate(model, o[:batchsize])
     lr = o[:lr]
     if o[:fast]
         @time (for epoch=1:o[:epochs]
-               train1(model, convnet, copy(s0), sequence[1]; batch_size=o[:batchsize], lr=lr, gclip=o[:gclip], cnnout=o[:cnnout])
+               train1(model,optim, convnet, copy(s0), sequence[1]; batch_size=o[:batchsize], lr=lr, gclip=o[:gclip], cnnout=o[:cnnout])
                end; gpu()>=0 && Knet.cudaDeviceSynchronize())
         return
     end
     losses = map(d->report_loss(model, convnet, copy(s0), d ; batch_size=o[:batchsize], cnnout=o[:cnnout]), sequence)
     println((:epoch,0,:loss,losses...))
-    devset = ifelse(length(data) > 1, 2, 1)
-    devlast = devbest = losses[devset]
-    for epoch=1:o[:epochs]
-        @time train1(model, copy(s0), sequence[1]; slen=o[:seqlength], lr=lr, gclip=o[:gclip])
-        @time losses = map(d->report_loss(model, convnet, copy(s0),d ; batch_size=o[:batchsize], cnnout=o[:cnnout]), sequence)
-        println((:epoch,epoch,:loss,losses...))
-        if o[:gcheck] > 0
-            gradcheck(loss, model, copy(s0), sequence[1], 1:o[:seqlength]; gcheck=o[:gcheck])
-        end
-        devloss = losses[devset]
-        if devloss < devbest
-            devbest = devloss
-            if o[:bestfile] != nothing
-                info("Saving best model to $(o[:bestfile])")
-                save(o[:bestfile], "model", model, "vocab", vocab)
-            end
-        end
-        if devloss > devlast
-            lr *= o[:decay]
-            info("New learning rate: $lr")
-        end
-        devlast = devloss
-    end
 end
 
 function delete_unbatchable_captions!(caption_dict,batch_size)
@@ -268,13 +245,13 @@ function minibatch(caption_dict, word_to_index, batch_size)
 
     index = 1; l = 1; input_index = 1;
 
-    global eos = falses(batch_size, length(word_to_index))
-    eos[:,end-1] = 1;
-    global eos = convert(KnetArray{Float32},eos);
-
-    global bos = falses(batch_size, length(word_to_index))
-    bos[:,end] = 1;
-    global bos = convert(KnetArray{Float32},bos);
+    # global eos = falses(batch_size, length(word_to_index))
+    # eos[:,end-1] = 1;
+    # global eos = convert(KnetArray{Float32},eos);
+    #
+    # global bos = falses(batch_size, length(word_to_index))
+    # bos[:,end] = 1;
+    # global bos = convert(KnetArray{Float32},bos);
 
     for i=1:batch_size:length(lengths)
         l = lengths[i]
@@ -344,74 +321,95 @@ function complete_karpathy_features(param, convnet, state, seq; batch_size=20, l
   return count;
 end
 
-function train1(param, convnet, state, seq; batch_size=20, lr=1.0, gclip=0.0, cnnout=4096)
-   #complete_karpathy_features(param, convnet, state, seq; batch_size=batch_size, lr=lr, gclip=gclip)
-   sequence = seq[1]
-   input_ids = seq[2]
-   lengths = seq[3]
+function train1(param,optim,convnet, state, seq; batch_size=20, lr=1.0, gclip=0.0, cnnout=4096)
+  #complete_karpathy_features(convnet, seq, batch_size)
+  sequence = seq[1]
+  input_ids = seq[2]
+  lengths = seq[3]
+
+  #index_to_char = Array(String, length(vocab))
+  #for (k,v) in vocab; index_to_char[v] = k; end
+  atype = typeof(param[1])
+  index = 1; l=1; input_index = 1;
+  #for t = 1:batch_size:length(lengths)
+ for t = 1:batch_size:10*batch_size
+
+     l = lengths[t]
+     input = Array(Float32, batch_size, cnnout);
+
+     for i=1:batch_size
+           id = input_ids[input_index][i]
+           filename = "./data/Flickr30k/karpathy/features/$id.jld";
+           if isfile(filename)
+             input[i,:] = load(filename, "feature");
+           else
+             println(id,"not found in karpathy features")
+             image = read_image_data("./data/Flickr30k/flickr30k-images/$id.jpg", averageImage)
+             image = convnet(image);
+             image = convert(Array{Float32},image);
+             save(filename, "feature", image)
+             input[i,:] = image;
+           end
+     end
 
 
-    index = 1; l=1; input_index = 1;
+     input = convert(KnetArray{Float32},input);
 
-    for t = 1:batch_size:length(lengths)
-        l = lengths[t]
-        #input_ids = inputs_ids[index:index+l-1]
-        #println(input_id)
-        input = Array(Float32, batch_size, cnnout);
-        for i=1:batch_size
-              id = input_ids[input_index][i]
-              filename = "./data/Flickr30k/karpathy/features/$id.jld";
-              if isfile(filename)
-                input[i,:] = load(filename, "feature");
-              else
-                println(id,"not found in karpathy features")
-                image = read_image_data("./data/Flickr30k/flickr30k-images/$id.jpg", averageImage)
-                image = convnet(image);
-                image= convert(Array{Float32},image);
-                save(filename, "feature", image)
-                input[i,:] = image;
-              end
-        end
+     # print(input_ids[input_index][1],":")
+     # for i=index:index+l-1
+     #   expected = find(sequence[i][1,:])
+     #   print(index_to_char[expected[1]],' ');
+     # end
+     #println();
 
-        input = convert(KnetArray{Float32},input);
-        #input = cnn_predict(convnet, input)
-        #input = ones(Float32, batch_size, 1000);
-        gloss = lossgradient(param, state, input, sequence, index:index+l-1)
+     gloss = lossgradient(param, state, input, sequence, index:index+l-1)
 
-        if t%1000 == 1
-          println(t,". sentence trained")
-          println("loss in sentence: ", loss(param, state, input, sequence, index:index+l-1))
-          Knet.knetgc();gc();
-        end
+     if t%100 == 1
+       println(t,".sentence trained")
+       println("loss in sentence: ", loss(param, state, input, sequence, index:index+l-1))
+     end
 
-        gscale = lr
-        if gclip > 0
-            gnorm = sqrt(mapreduce(sumabs2, +, 0, gloss))
-            if gnorm > gclip
-                gscale *= gclip / gnorm
-            end
-        end
+     if gclip > 0
+        gnorm = sqrt(mapreduce(sumabs2, +, 0, gloss))
+         if gnorm > gclip
+           for k=1:length(gloss)
+             gloss[k] = (gloss[k] * gclip) / gnorm
+           end
+         end
+     end
 
-        for k in 1:length(param)
-            # param[k] -= gscale * gloss[k]
-            axpy!(-gscale, gloss[k], param[k])
-        end
+     for k in 1:length(param)
+         update!(param, gloss, optim);
+     end
 
-        isa(state,Vector{Any}) || error("State should not be Boxed.")
-        # The following is needed in case AutoGrad boxes state values during gradient calculation
-        for i = 1:length(state)
-            state[i] = AutoGrad.getval(state[i])
-        end
+     Knet.knetgc(); gc;
 
-        index = index +l;
-        input_index += 1
+     isa(state,Vector{Any}) || error("State should not be Boxed.")
+     # The following is needed in case AutoGrad boxes state values during gradient calculation
+     for i = 1:length(state)
+         state[i] = AutoGrad.getval(state[i])
+     end
+
+     index = index + l;
+     input_index += 1
+
     end
+end
+
+function initparams(model)
+  prms = Array(Any,length(model))
+  for k=1:length(prms)
+    prms[k] = Adam()
+  end
+  return prms
 end
 
 function report_loss(param, convnet, state, seq; batch_size=20, cnnout=4096)
 
   total = 0.0; count = 0
+
   atype = typeof(AutoGrad.getval(param[1]))
+
   sequence = seq[1]
   input_ids = seq[2]
   lengths = seq[3]
@@ -421,7 +419,7 @@ function report_loss(param, convnet, state, seq; batch_size=20, cnnout=4096)
   for t = 1:batch_size:length(lengths)
     l = lengths[t]
 
-    input = Array(Float32,batch_size,cnnout);
+    input = Array(Float32, batch_size, cnnout);
 
     for i=1:batch_size
           id = input_ids[input_index][i]
@@ -432,13 +430,15 @@ function report_loss(param, convnet, state, seq; batch_size=20, cnnout=4096)
             println(id,"not found in karpathy features")
             image = read_image_data("./data/Flickr30k/flickr30k-images/$id.jpg", averageImage)
             image = convnet(image);
-            input[i,:] = convert(Array{Float32},image);
+            image= convert(Array{Float32},image);
+            save(filename, "feature", image)
+            input[i,:] = image;
           end
     end
 
-    #input = ones(Float32,224,224,3,1);
-    #input = cnn_predict(convnet, input)
-    input = convert(atype,input)
+
+    input = convert(atype,input);
+
     lstm_input = bos;
     #input = ones(Float32, 1, 1000);
 
@@ -464,30 +464,39 @@ function report_loss(param, convnet, state, seq; batch_size=20, cnnout=4096)
 end
 
 
-
 function initweights(atype, hidden, vocab, embed, cnnout, winit)
-    param = Array(Any, 2*length(hidden)+3)
-    input = embed
-    for k = 1:length(hidden)
-        param[2k-1] = winit*randn(input+hidden[k], 4*hidden[k])
-        param[2k]   = zeros(1, 4*hidden[k])
-        param[2k][1:hidden[k]] = 1 # forget gate bias
-        input = hidden[k]
-    end
-    param[end-2] = winit*randn(cnnout+vocab,embed)
-    param[end-1] = winit*randn(hidden[end],vocab)
-    param[end] = zeros(1,vocab)
-    return map(p->convert(atype,p), param)
+  init(d...)=atype(xavier(d...))
+  bias(d...)=atype(zeros(d...))
+  model = Array(Any, 2*length(hidden)+4)
+  X = embed
+  for k = 1:length(hidden)
+    H = hidden[k]
+    model[2k-1] = init(X+H, 4H)
+    model[2k] = bias(1, 4H)
+    model[2k][1:H] = 1 # forget gate bias = 1
+    X = H
+  end
+  model[end-3] = winit*init(cnnout,Int(embed/2))
+  model[end-2] = init(vocab,Int(embed/2))
+  model[end-1] = init(hidden[end],vocab)
+  model[end] = bias(1,vocab)
+  return model;
 end
 
-# state[2k-1,2k]: hidden and cell for the k'th lstm layer
-function initstate(atype, hidden, batchsize)
-    state = Array(Any, 2*length(hidden))
-    for k = 1:length(hidden)
-        state[2k-1] = zeros(batchsize,hidden[k])
-        state[2k] = zeros(batchsize,hidden[k])
+let blank = nothing; global initstate
+function initstate(model, batch)
+    nlayers = div(length(model)-3,2)
+    state = Array(Any, 2*nlayers)
+    for k = 1:nlayers
+        bias = model[2k]
+        hidden = div(length(bias),4)
+        if typeof(blank)!=typeof(bias) || size(blank)!=(batch,hidden)
+            blank = fill!(similar(bias, batch, hidden),0)
+        end
+        state[2k-1] = state[2k] = blank
     end
-    return map(s->convert(atype,s), state)
+    return state
+end
 end
 
 function lstm(weight,bias,hidden,cell,input)
@@ -503,7 +512,9 @@ function lstm(weight,bias,hidden,cell,input)
 end
 
 function lrcn(w,s, x_cnn, x_lstm)
-  x = hcat(x_cnn,x_lstm) * w[end-2]
+  y = x_cnn*w[end-3];
+  z = x_lstm*w[end-2];
+  x = hcat(y,z);
   for i = 1:2:length(s)
       (s[i],s[i+1]) = lstm(w[i],w[i+1],s[i],s[i+1],x)
       x = s[i]
@@ -511,11 +522,11 @@ function lrcn(w,s, x_cnn, x_lstm)
   return x * w[end-1] .+ w[end]
 end
 
-
 function loss(param,state,input,sequence,range)
     total = 0.0; count = 0
     atype = typeof(AutoGrad.getval(param[1]))
     lstm_input = bos;
+
     for t in range
         ypred = lrcn(param,state,input,lstm_input)
         ynorm = logp(ypred,2) # ypred .- log(sum(exp(ypred),2))
@@ -539,19 +550,43 @@ lossgradient = grad(loss);
 function generate(param, convnet,  state, input, vocab, nword)
     index_to_char = Array(String, length(vocab))
     for (k,v) in vocab; index_to_char[v] = k; end
+
     input = convnet(input);
+    index = 1;
+
+    println("Generating Starts");
+    lstm_input = bos;
+    for i=1:nword
+        ypred = lrcn(param,state,input,lstm_input)
+        ynorm = logp(ypred,2);
+        index = sample(exp(ynorm));
+        lstm_input = convert(KnetArray{Float32}, ynorm .== maximum(ynorm))
+        print(index_to_char[index], " ");
+    end
+    println();
+    println("Generating Done")
+end
+
+
+function generate2(param, id,  state, vocab, nword)
+    index_to_char = Array(String, length(vocab))
+    for (k,v) in vocab; index_to_char[v] = k; end
+
+    filename = "./data/Flickr30k/karpathy/features/$id.jld";
+    input = zeros(Float32,1,4096);
+    if isfile(filename)
+      input[1,:] = load(filename, "feature");
+    end
+    input = convert(typeof(param[1]),input);
+
     index = 1
     println("Generating Starts");
     lstm_input = bos;
     for i=1:nword
         ypred = lrcn(param,state,input,lstm_input)
-        ynorm = logp(ypred);
-        lstm_input = (ynorm .== maximum(ynorm)) .* ynorm;
+        ynorm = logp(ypred,2);
         index = sample(exp(ynorm));
-        if index == length(vocab)
-          #eos
-          break;
-        end
+        lstm_input = convert(KnetArray, ynorm .== maximum(ynorm))
         print(index_to_char[index], " ");
     end
     println();

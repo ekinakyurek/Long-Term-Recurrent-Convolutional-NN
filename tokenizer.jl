@@ -31,7 +31,7 @@ function tokenize_flicker_captions(captions)
       id = parse(Int64,id)
       count = 4;
       for i=4:length(words)
-        words[count] = lowercase(strip(words[count],[' ', '.', ',','#', '\'', ')', '(', '!', '/', '?', '\t']))
+        words[count] = lowercase(strip(words[count],[' ', '.', ',','#', '\'', ')', '(', '!', '/', '?', '\t', '`']))
         if length(words[count]) < 1
           deleteat!(words,count)
           count-=1;
@@ -51,7 +51,7 @@ function tokenize_mscoco_captions(captions)
       words = split(obj["caption"],' ');
       count = 1;
       for i=1:length(words)
-        words[count] = lowercase(strip(words[count],[' ', '.', ',', '#', '\'', ')', '(', '!', '/', '?', '\t']))
+        words[count] = lowercase(strip(words[count],[' ', '.', ',', '#', '\'', ')', '(', '!', '/', '?', '\t', '`']))
         if length(words[count]) < 1
           deleteat!(words,count)
           count-=1;
