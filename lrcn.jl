@@ -102,11 +102,11 @@ function main(args=ARGS)
       #println(101, " ", Knet.gpufree());
       info("Reading $(o[:model])");
       #Uncomment below if VGG part is needed
-      #vgg = matread(o[:model]);
-      #params = get_params_cnn(vgg)
-      #convnet = get_convnet(params...);
-      convnet = nothing
-      #global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
+      vgg = matread(o[:model]);
+      params = get_params_cnn(vgg)
+      convnet = get_convnet(params...);
+      #convnet = nothing
+      global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
       info("Cnn is initialized")
 
       println("Intializing LSTM weigths")
@@ -128,16 +128,28 @@ function main(args=ARGS)
 
     info("$(length(vocab)) unique words")
 
-    # if o[:generate] > 0
-    #     println("Generation starts")
-    #     state = initstate(model,1)
-    #     img = read_image_data(o[:image], averageImage)
-    #     #initialize eos and bos with batchsize 1;
-    #     initeosbos(1;atype=o[:atype]);
-    #     #Generate captions for given image
-    #     generate_with_image(model, convnet, state, img, vocab, o[:generate])
-    #     println("Generation finished")
-    # end
+    if o[:generate] > 0
+        println("Generation starts")
+        #
+        # img = read_image_data(o[:image], averageImage)
+        # #initialize eos and bos with batchsize 1;
+        # #initeosbos(1;atype=o[:atype]);
+        # #Generate captions for given image
+        # generate_with_image(model, convnet, initstate(model,1), img, vocab, o[:generate])
+
+        #Flickr dataset image id for first bath first element.
+        id = 1000268201;
+        println(id,": ");
+        #image = read_image_data("./data/Flickr30k/flickr30k-images/$id.jpg", averageImage)
+        #Initialize eos and bos with batchsize 1
+        #initeosbos(1);
+        #Generate from id of image in Flickr30k database
+        generate_with_id(model,id,initstate(model, 1),vocab,o[:generate]);
+        #generate(model, convnet, state, image, vocab, o[:generate])
+        println("Generation finished")
+    end
+
+
 
 
     if !isempty(caption_dicts)
@@ -151,18 +163,19 @@ function main(args=ARGS)
       caption_dicts = 0; Knet.knetgc(); gc();
       println("Data is created")
       println("Training starts:....")
+
       train!(model, optim ,convnet, sequence, vocab, o)
+
       println("Generating after training......")
       for i=1:o[:recall]
-        state = initstate(model, 1);
         #Flickr dataset image id for first bath first element.
         id = sequence[1][2][1][1]
         println(id,": ",i, ".","try ");
-        image = read_image_data("./data/Flickr30k/flickr30k-images/$id.jpg", averageImage)
+        #image = read_image_data("./data/Flickr30k/flickr30k-images/$id.jpg", averageImage)
         #Initialize eos and bos with batchsize 1
         #initeosbos(1);
         #Generate from id of image in Flickr30k database
-        generate_with_id(model,id,state,vocab,o[:generate]);
+        generate_with_id(model,id,initstate(model, 1),vocab,o[:generate]);
         #generate(model, convnet, state, image, vocab, o[:generate])
       end
       println("Generation finished")
@@ -204,7 +217,7 @@ function train!(model, optim, convnet, sequence, vocab, o)
         return
     end
 
-    losses = map(d->report_loss(model, convnet, copy(s0), d ; batch_size=o[:batchsize], cnnout=o[:cnnout]), sequence, prdop=0.9)
+    losses = map(d->report_loss(model, convnet, copy(s0), d ; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.9), sequence)
     println((:epoch,0,:loss,losses...))
 end
 
@@ -454,9 +467,9 @@ function report_loss(param, convnet, state, seq; batch_size=20, cnnout=4096, aty
 
     cnn_input = input*param[end-3];
     lstm_input = param[end-2][bos,:];
-
+    new_state = copy(state);
     for t in  index:index+l-1
-        ypred = lrcn(param,state,input,lstm_input;pdrop=pdrop)
+        ypred = lrcn(param,new_state,cnn_input,lstm_input;pdrop=pdrop)
         ynorm = logp(ypred,2) # ypred .- log(sum(exp(ypred),2))
         for i=1:batchsize
             total  += ynorm[i,sequence[t][i]]
@@ -465,7 +478,7 @@ function report_loss(param, convnet, state, seq; batch_size=20, cnnout=4096, aty
         lstm_input = param[end-2][sequence[t],:];
     end
 
-    ypred = lrcn(param,state,input,lstm_input; pdrop=pdrop)
+    ypred = lrcn(param,state,cnn_input,lstm_input; pdrop=pdrop)
     ynorm = logp(ypred,2) # ypred .- log(sum(exp(ypred),2))
 
     for i=1:batchsize
