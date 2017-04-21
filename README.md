@@ -1,13 +1,11 @@
 # LRCN
 Long-termRecurrentNeuralNetworks
 
-To train(You mush have data folder in the repository):
+To train(You must have data folder in the repository):
 
-julia lrcn.jl --fast
+julia lrcn.jl --fast --batchsize 32 --generate 30
 
-To generate:
-
-julia lrcn.jl img_path --generate 100
+It generates a caption for an image after each epoch about a picture in the dataset.
 
 This example implements the Long-term recurrent convolutional network model from
 
