@@ -48,16 +48,13 @@ function main(args=ARGS)
         ("--cnnout"; arg_type=Int; default=4096; help="Size of the cnn visual output vector.");
         ("--epochs"; arg_type=Int; default=20; help="Number of epochs for training.")
         ("--recall"; arg_type=Int; default=5; help="Number of tries for caption generation.")
-        ("--batchsize"; arg_type=Int; default=20; help="Number of sequences to train on in parallel.")
-        ("--seqlength"; arg_type=Int; default=100; help="Number of steps to unroll the network for.")
-        ("--decay"; arg_type=Float64; default=0.9; help="Learning rate decay.")
+        ("--batchsize"; arg_type=Int; default=30; help="Number of senteces to train on in parallel.")
         ("--lr"; arg_type=Float64; default=2.0; help="Initial learning rate.")
         ("--gclip"; arg_type=Float64; default=5.0; help="Value to clip the gradient norm at.")
-        ("--winit"; arg_type=Float64; default=0.08; help="Initial weights set to winit*randn().")
-        ("--gcheck"; arg_type=Int; default=0; help="Check N random gradients.")
         ("--seed"; arg_type=Int; default=-1; help="Random number seed.")
         ("--atype"; default=(gpu()>=0 ? "KnetArray{Float32}" : "Array{Float32}"); help="array type: Array for cpu, KnetArray for gpu")
         ("--fast"; action=:store_true; help="skip loss printing for faster run")
+        ("--vggon"; action=:store_true; help="load vgg weights")
         #TODO ("--dropout"; arg_type=Float64; default=0.0; help="Dropout probability.")
         ("--top"; default=5; arg_type=Int; help="Display the top N classes")
     end
@@ -74,23 +71,21 @@ function main(args=ARGS)
         eval(Expr(:using,:JLD))
     end
 
-    global feats = load("./data/Flickr30k/karpathy/features/feats.jld", "features")
-    #println(77, " ", Knet.gpufree());
+    global batchsize = o[:batchsize];
+
     a = KnetArray(Float32,2,2) * KnetArray(Float32,2,2); #To initialize cudablas
-    #println(79," ",  Knet.gpufree());
     isempty(o[:datafiles])  && push!(o[:datafiles],Flickr30k_captions) # Flickr30k
 
 
       println("Tokenization starts")
       #vocab = {"words1"=>1,"words2"=>2, ....}
-      global vocab = Dict{String, Int}()
-      #println(86, " ", Knet.gpufree());
       #captions_dicts = [((id1, ["word1","word2",...]),length1),((id2, ["word1","word2",...]),length2),...]
+      global vocab = Dict{String, Int}();
       caption_dicts = Array{Array{Tuple{Tuple{Int64,Array{String,1}},Int64},1},1}()
       Tokenizer.tokenize(vocab, caption_dicts; data_files=o[:datafiles])
-      #println(90, " ", Knet.gpufree());
       get!(vocab,"~",1+length(vocab)) #eos
       get!(vocab,"``",1+length(vocab)) #bos
+      global vocab_size = length(vocab);
       info("Tokenization finished with captions")
 
       println("Intializing cnn_weights")
@@ -102,51 +97,51 @@ function main(args=ARGS)
       #println(101, " ", Knet.gpufree());
       info("Reading $(o[:model])");
       #Uncomment below if VGG part is needed
-      vgg = matread(o[:model]);
-      params = get_params_cnn(vgg)
-      convnet = get_convnet(params...);
-      #convnet = nothing
-      global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
+      convnet = nothing
+      if o[:vggon]
+        vgg = matread(o[:model]);
+        params = get_params_cnn(vgg)
+        convnet = get_convnet(params...);
+        global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
+      end
       info("Cnn is initialized")
 
       println("Intializing LSTM weigths")
      if o[:loadfile]==nothing
-       model = initweights(o[:atype], o[:hidden], length(vocab), o[:embed], o[:cnnout], o[:winit])
+       model = initweights(o[:atype], o[:hidden], vocab_size, o[:embed], o[:cnnout])
      else
        info("Loading model from $(o[:loadfile])")
        model = map(p->convert(o[:atype],p), load(o[:loadfile], "model"))
      end
-
     #  println(113, " ", Knet.gpufree());
       optim = initparams(model);
     #  println(115, " ", Knet.gpufree());
       info("LSTM is initialized")
 
+      global feats = load("./data/Flickr30k/karpathy/features/feats.jld", "features")
 
-    global vocab_size = length(vocab);
-    global batchsize = o[:batchsize];
 
     info("$(length(vocab)) unique words")
 
     if o[:generate] > 0
-        println("Generation starts")
+      if o[:vggon]
         #
-        # img = read_image_data(o[:image], averageImage)
+         img = read_image_data(o[:image], averageImage)
         # #initialize eos and bos with batchsize 1;
         # #initeosbos(1;atype=o[:atype]);
         # #Generate captions for given image
-        # generate_with_image(model, convnet, initstate(model,1), img, vocab, o[:generate])
-
+         generate_with_image(model, convnet, initstate(model,1), img, vocab, o[:generate])
+      else
         #Flickr dataset image id for first bath first element.
         id = 1000268201;
-        println(id,": ");
         #image = read_image_data("./data/Flickr30k/flickr30k-images/$id.jpg", averageImage)
         #Initialize eos and bos with batchsize 1
         #initeosbos(1);
         #Generate from id of image in Flickr30k database
-        generate_with_id(model,id,initstate(model, 1),vocab,o[:generate]);
+        generate_with_id(model,id,initstate(model, 1), vocab,o[:generate]);
         #generate(model, convnet, state, image, vocab, o[:generate])
         println("Generation finished")
+      end
     end
 
 
@@ -154,7 +149,7 @@ function main(args=ARGS)
 
     if !isempty(caption_dicts)
       #init eos and bos with given batchsize
-      initeosbos(o[:batchsize]);
+      initeosbos(batchsize);
     #  println(141, " ", Knet.gpufree());
       #get word sequences for caption datasets;
       sequence = map(t->minibatch(t, vocab, o[:batchsize]), caption_dicts)
@@ -163,22 +158,7 @@ function main(args=ARGS)
       caption_dicts = 0; Knet.knetgc(); gc();
       println("Data is created")
       println("Training starts:....")
-
       train!(model, optim ,convnet, sequence, vocab, o)
-
-      println("Generating after training......")
-      for i=1:o[:recall]
-        #Flickr dataset image id for first bath first element.
-        id = sequence[1][2][1][1]
-        println(id,": ",i, ".","try ");
-        #image = read_image_data("./data/Flickr30k/flickr30k-images/$id.jpg", averageImage)
-        #Initialize eos and bos with batchsize 1
-        #initeosbos(1);
-        #Generate from id of image in Flickr30k database
-        generate_with_id(model,id,initstate(model, 1),vocab,o[:generate]);
-        #generate(model, convnet, state, image, vocab, o[:generate])
-      end
-      println("Generation finished")
     end
 
     if o[:savefile] != nothing
@@ -203,7 +183,7 @@ function train!(model, optim, convnet, sequence, vocab, o)
     #complete_karpathy_features(convnet, sequence[1], o[:batchsize])
     if o[:fast]
         @time (for epoch=1:o[:epochs]
-                 train1(model, optim, convnet, s0, sequence[1]; batch_size=o[:batchsize], lr=lr, gclip=o[:gclip], cnnout=o[:cnnout], pdrop=0.9)
+                 train1(model, optim, convnet, s0, sequence[1]; batch_size=o[:batchsize], lr=lr, gclip=o[:gclip], cnnout=o[:cnnout], pdrop=0.0)
                  Knet.knetgc(); gc();
                  id = 1000268201;
                  generate_with_id(model,id, initstate(model, 1), vocab, o[:generate]);
@@ -213,12 +193,14 @@ function train!(model, optim, convnet, sequence, vocab, o)
                      save(o[:savefile], "model", model, "vocab", vocab)
                  end
                  #epoch == 1  &&  save("./data/Flickr30k/karpathy/features/feats.jld", "features", feats);
+                 losses = map(d->report_loss(model, convnet, copy(s0), d ; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0), sequence)
+                  println((:epoch,0,:loss,losses...))
                end; gpu()>=0 && Knet.cudaDeviceSynchronize())
         return
     end
 
-    losses = map(d->report_loss(model, convnet, copy(s0), d ; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.9), sequence)
-    println((:epoch,0,:loss,losses...))
+
+
 end
 
 
@@ -500,7 +482,7 @@ function report_loss(param, convnet, state, seq; batch_size=20, cnnout=4096, aty
 end
 
 
-function initweights(atype, hidden, vocab, embed, cnnout, winit)
+function initweights(atype, hidden, vocab, embed, cnnout)
   init(d...)=atype(xavier(d...))
   bias(d...)=atype(zeros(d...))
   model = Array(Any, 2*length(hidden)+4)

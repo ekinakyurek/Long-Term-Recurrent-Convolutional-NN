@@ -3,7 +3,7 @@ Long-termRecurrentNeuralNetworks
 
 To train(You must have data folder in the repository):
 
-julia lrcn.jl --fast --batchsize 32 --generate 30
+julia lrcn.jl --fast --generate 30
 
 It generates a caption for an image after each epoch about a picture in the dataset.
 
