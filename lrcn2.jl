@@ -38,7 +38,7 @@ function main(args=ARGS)
         ("--bestfile"; help="Save best model to file")
         ("--generate"; arg_type=Int; default=0; help="If non-zero generate given number of characters.")
         ("--hidden"; nargs='+'; arg_type=Int; default=[1000]; help="Sizes of one or more LSTM layers.")
-        ("--embed"; arg_type=Int; default=1000; help="Size of the embedding vector.")
+        ("--embed"; arg_type=Int; default=512; help="Size of the embedding vector.")
         ("--cnnout"; arg_type=Int; default=4096; help="Size of the cnn visual output vector.");
         ("--epochs"; arg_type=Int; default=5; help="Number of epochs for training.")
         ("--recall"; arg_type=Int; default=5; help="Number of tries for caption generation.")
@@ -50,7 +50,7 @@ function main(args=ARGS)
         ("--fast"; action=:store_true; help="skip loss printing for faster run")
         ("--vggon"; action=:store_true; help="load vgg weights")
         ("--feature";action=:store_true; help="extract features")
-        ("--beam_width";arg_type=Int;default=5;help="width of beam search")
+        ("--beam_width";arg_type=Int;default=2;help="width of beam search")
         #TODO ("--dropout"; arg_type=Float64; default=0.0; help="Dropout probability.")
     end
   println(s.description)
@@ -65,8 +65,8 @@ function main(args=ARGS)
       eval(Expr(:using,:JLD))
   end
 
-  isempty(o[:datafiles]) && push!(o[:datafiles],Flickr30k_captions) # Flickr30k is default
-  #isempty(o[:datafiles]) && push!(o[:datafiles],MsCoCo_validation)
+  #isempty(o[:datafiles]) && push!(o[:datafiles],Flickr30k_captions) # Flickr30k is default
+  isempty(o[:datafiles]) && push!(o[:datafiles],MsCoCo_captions, MsCoCo_validation)
   gpu()>=0 && KnetArray(Float32,2,2) * KnetArray(Float32,2,2); #To initialize cudablas
 
   println("Tokenization starts")
@@ -110,7 +110,9 @@ function main(args=ARGS)
   end
 
   println("Loading existing features to train")
-  global feats = load("./data/Flickr30k/featsn.jld", "features")
+  #global feats = load("./data/Flickr30k/featsn.jld", "features")
+  global feats = load("./data/MsCoCo/train2014/train_featsn","features");
+  global featsvl = load("./data/MsCoCo/val2014/val_featsn", "features");
   println("Features loaded")
 
   if o[:generate] > 0
@@ -186,14 +188,17 @@ function train!(model, optim, sequence, vocab, o)
     s0 = initstate(model, o[:batchsize])
     if o[:fast]
          for epoch=1:o[:epochs]
-               train1(model, optim, s0, sequence[1]; batch_size=o[:batchsize], lr=o[:lr], gclip=o[:gclip], cnnout=o[:cnnout], pdrop=0.7)
+               train1(model, optim, s0, sequence[1]; batch_size=o[:batchsize], lr=o[:lr], gclip=o[:gclip], cnnout=o[:cnnout], pdrop=0.0)
                if o[:savefile] != nothing
                    info("Saving last model to $(o[:savefile])")
                    save(o[:savefile], "model", model, "vocab", vocab)
                end
-               losses = map(d->average_loss(model, d ; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0), sequence)
+               losses = zeros(Float32, 2);
+               losses[1] = average_loss(model, sequence[1],feats; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0)
+               losses[2] = average_loss(model, sequence[2],featsvl; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0)
+               #losses = map(d->average_loss(model, d ; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0), sequence)
                println((:epoch,epoch,:loss,losses...))
-               datasheet = open("e1000_h1000_p_0.7.out","a+");
+               datasheet = open("e512_h1000_p_0.0.out","a+");
                println(datasheet,(:epoch,epoch,:loss,losses...));
                close(datasheet);
           end
@@ -358,7 +363,7 @@ function initparams(model)
   return prms
 end
 
-function average_loss(param, seq; batch_size=20, cnnout=4096, atype=KnetArray{Float32}, pdrop=0.0)
+function average_loss(param, seq, featsms; batch_size=20, cnnout=4096, atype=KnetArray{Float32}, pdrop=0.0)
 
   sequence = seq[1]
   input_ids = seq[2]
@@ -400,7 +405,7 @@ function average_loss(param, seq; batch_size=20, cnnout=4096, atype=KnetArray{Fl
      #println("length of the senteces in the batch: ", l);
      for i=1:batch_size
            id = input_ids[input_index][i]
-           feature_index = get(feats,id,nothing)
+           feature_index = get(featsms,id,nothing)
            input[i,:] = convert(atype,feature_index);
      end
 
