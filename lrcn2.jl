@@ -38,10 +38,10 @@ function main(args=ARGS)
         ("--bestfile"; help="Save best model to file")
         ("--generate"; arg_type=Int; default=0; help="If non-zero generate given number of characters.")
         ("--hidden"; nargs='+'; arg_type=Int; default=[1000]; help="Sizes of one or more LSTM layers.")
-        ("--embed"; arg_type=Int; default=512; help="Size of the embedding vector.")
+        ("--embed"; arg_type=Int; default=1000; help="Size of the embedding vector.")
         ("--cnnout"; arg_type=Int; default=4096; help="Size of the cnn visual output vector.");
         ("--epochs"; arg_type=Int; default=5; help="Number of epochs for training.")
-        ("--recall"; arg_type=Int; default=5; help="Number of tries for caption generation.")
+        ("--recall"; arg_type=Int; default=10; help="Number of tries for caption generation.")
         ("--batchsize"; arg_type=Int; default=80; help="Number of senteces to train on in parallel.")
         ("--lr"; arg_type=Float64; default=0.1; help="Initial learning rate.")
         ("--gclip"; arg_type=Float64; default=5.0; help="Value to clip the gradient norm at.")
@@ -111,8 +111,8 @@ function main(args=ARGS)
 
   println("Loading existing features to train")
   #global feats = load("./data/Flickr30k/featsn.jld", "features")
-  global feats = load("./data/MsCoCo/train2014/train_featsn","features");
-  global featsvl = load("./data/MsCoCo/val2014/val_featsn", "features");
+  global feats = load("./data/MsCoCo/train2014/train_featsn.jld","features");
+  global featsvl = load("./data/MsCoCo/val2014/val_featsn.jld", "features");
   println("Features loaded")
 
   if o[:generate] > 0
