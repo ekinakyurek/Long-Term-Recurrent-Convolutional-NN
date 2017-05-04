@@ -41,103 +41,124 @@ function main(args=ARGS)
         ("--embed"; arg_type=Int; default=1000; help="Size of the embedding vector.")
         ("--cnnout"; arg_type=Int; default=4096; help="Size of the cnn visual output vector.");
         ("--epochs"; arg_type=Int; default=5; help="Number of epochs for training.")
-        ("--recall"; arg_type=Int; default=5; help="Number of tries for caption generation.")
+        ("--capnumber"; arg_type=Int; default=1000; help="Number of captions will be generated.")
         ("--batchsize"; arg_type=Int; default=80; help="Number of senteces to train on in parallel.")
         ("--lr"; arg_type=Float64; default=0.1; help="Initial learning rate.")
         ("--gclip"; arg_type=Float64; default=5.0; help="Value to clip the gradient norm at.")
         ("--seed"; arg_type=Int; default=-1; help="Random number seed.")
         ("--atype"; default=(gpu()>=0 ? "KnetArray{Float32}" : "Array{Float32}"); help="array type: Array for cpu, KnetArray for gpu")
-        ("--fast"; action=:store_true; help="skip loss printing for faster run")
-        ("--vggon"; action=:store_true; help="load vgg weights")
-        ("--feature";action=:store_true; help="extract features")
-        ("--beam_width";arg_type=Int;default=5;help="width of beam search")
+        ("--train"; action=:store_true; help="skip loss printing for faster run")
+        ("--cnn"; action=:store_true; help="loads cnn weights")
+        ("--extfeatures";action=:store_true; help="extract features")
+        ("--flickr";action=:store_true; help="works on flickr30k dataset")
+        ("--coco";action=:store_true; help="works on mscoco 2014 dataset")
+        ("--beam_width";arg_type=Int;default=3;help="width of beam search")
         #TODO ("--dropout"; arg_type=Float64; default=0.0; help="Dropout probability.")
     end
-  println(s.description)
-  isa(args, AbstractString) && (args=split(args))
-  o = parse_args(args, s; as_symbols=true)
-  println("opts=",[(k,v) for (k,v) in o]...)
-  o[:seed] > 0 && srand(o[:seed])
-  o[:atype] = eval(parse(o[:atype]))
+    println(s.description)
+    isa(args, AbstractString) && (args=split(args))
+    o = parse_args(args, s; as_symbols=true)
+    println("opts=",[(k,v) for (k,v) in o]...)
+    o[:seed] > 0 && srand(o[:seed])
+    o[:atype] = eval(parse(o[:atype]))
 
-  if any(f->(o[f]!=nothing), (:loadfile, :savefile, :bestfile))
-      Pkg.installed("JLD")==nothing && Pkg.add("JLD") # error("Please Pkg.add(\"JLD\") to load or save files.")
-      eval(Expr(:using,:JLD))
-  end
-
-  isempty(o[:datafiles]) && push!(o[:datafiles],Flickr30k_captions) # Flickr30k is default
-  #isempty(o[:datafiles]) && push!(o[:datafiles],MsCoCo_validation)
-  gpu()>=0 && KnetArray(Float32,2,2) * KnetArray(Float32,2,2); #To initialize cudablas
-
-  println("Tokenization starts")
-  #vocab = {"words1"=>1,"words2"=>2, ....}
-  #captions_dicts = [((id1, ["word1","word2",...]),length1),((id2, ["word1","word2",...]),length2),...]
-  global vocab = Dict{String, Int}();
-  caption_dicts = Array{Array{Tuple{Tuple{Int64,Array{String,1}},Int64},1},1}()
-  Tokenizer.tokenize(vocab, caption_dicts; data_files=o[:datafiles])
-  println("Tokenization finished")
-
-  global vocab_size = length(vocab);
-  global batchsize = o[:batchsize];
-
-  println("Intializing LSTM weigths")
-  if o[:loadfile]==nothing
-   model = initweights(o[:atype], o[:hidden], vocab_size, o[:embed], o[:cnnout])
-  else
-   info("Loading model from $(o[:loadfile])")
-   model = map(p->convert(o[:atype],p), load(o[:loadfile], "model"))
-   global vocab = load(o[:loadfile], "vocab")
-   global vocab_size = length(vocab);
-  end
-  optim = initparams(model);
-  println("LSTM is initialized")
-  println("$vocab_size unique words")
-
-  global convnet = nothing; global averageImage = nothing;
-  if o[:vggon]
-    println("Intializing cnn_weights")
-    info("Reading $(o[:model])");
-    if !isfile(o[:model])
-     println("Should I download the VGG model (492MB)? Enter 'y' to download, anything else to quit.")
-     readline() == "y\n" || return
-     download(vggurl,o[:model])
+    if any(f->(o[f]!=nothing), (:loadfile, :savefile, :bestfile))
+        Pkg.installed("JLD")==nothing && Pkg.add("JLD") # error("Please Pkg.add(\"JLD\") to load or save files.")
+        eval(Expr(:using,:JLD))
     end
-    vgg = matread(o[:model]);
-    params = get_params_cnn(vgg)
-    global convnet = get_convnet(params...);
-    global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
-    info("Cnn is initialized")
-  end
 
-  println("Loading existing features to train")
-  global feats = load("./data/Flickr30k/featsn.jld", "features")
-  println("Features loaded")
+    isempty(o[:datafiles]) && (o[:flickr] && push!(o[:datafiles],Flickr30k_captions))
+    isempty(o[:datafiles]) && (o[:coco] && push!(o[:datafiles],MsCoCo_captions, MsCoCo_validation))
 
-  if o[:generate] > 0
-    if o[:vggon]
-      image = read_image_data(o[:image], averageImage)
-      for i=1:o[:recall]
-       generate(model,initstate(model,1), image, vocab, o[:generate], o[:beam_width])
-      end
+    gpu()>=0 && KnetArray(Float32,1) * KnetArray(Float32,1); #To initialize cudablas
+    global batchsize = o[:batchsize];
+
+    if !isempty(o[:datafiles])
+      println("Tokenization starts")
+      #vocab = {"words1"=>1,"words2"=>2, ....}
+      #captions_dicts = [((id1, ["word1","word2",...]),length1),((id2, ["word1","word2",...]),length2),...]
+      global vocab = Dict{String, Int}();
+      caption_dicts = Array{Array{Tuple{Tuple{Int64,Array{String,1}},Int64},1},1}()
+      Tokenizer.tokenize(vocab, caption_dicts; data_files=o[:datafiles])
+      println("Tokenization finished")
+      global vocab_size = length(vocab);
+    end
+
+    println("Intializing LSTM weigths")
+    if o[:loadfile]==nothing
+      model = initweights(o[:atype], o[:hidden], vocab_size, o[:embed], o[:cnnout])
     else
-      #DBG: Add random selection from dataset
-      for i=1:o[:recall]
-       id =caption_dicts[1][rand(1:end)][1][1];
-       generate(model,initstate(model, 1), id, vocab,o[:generate], o[:beam_width]);
-      end
+      info("Loading model from $(o[:loadfile])")
+      model = map(p->convert(o[:atype],p), load(o[:loadfile], "model"))
+      global vocab = load(o[:loadfile], "vocab")
+      global vocab_size = length(vocab);
     end
-  end
+    if[:train]
+      optim = initparams(model);
+    end
+    println("LSTM is initialized")
+
+    println("$vocab_size unique words")
+
+    global convnet = nothing; global averageImage = nothing;
+    if o[:cnn]
+      println("Intializing cnn_weights")
+      info("Reading $(o[:model])");
+      if !isfile(o[:model])
+       println("Should I download the VGG model (492MB)? Enter 'y' to download, anything else to quit.")
+       readline() == "y\n" || return
+       download(vggurl,o[:model])
+      end
+      vgg = matread(o[:model]);
+      params = get_params_cnn(vgg)
+      global convnet = get_convnet(params...);
+      global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
+      println("Cnn is initialized")
+    end
+
+
+    if[:train]
+      println("Loading existing features to train")
+      o[:flickr] && (global feats = load("./data/Flickr30k/featsn.jld", "features"))
+      o[:coco] && global feats = load("./data/MsCoCo/train2014/train_featsn.jld","features");
+      o[:coco] && global featsvl = load("./data/MsCoCo/val2014/val_featsn.jld", "features");
+      println("Features loaded")
+    end
+
+    if o[:generate] > 0
+      if o[:cnn]
+          image = read_image_data(o[:image], averageImage)
+          generate(model,initstate(model,1), image, vocab, o[:generate], o[:beam_width])
+      else
+          o[:flickr] && (out = open("candidates_flickr.txt","w")) && (in_out = open("candidate_ids_flickr.txt","w")) && (dict = caption_dicts[3])
+          o[:coco] && (out = open("candidates_coco.txt","w")) && (in_out = open("candidate_ids_coco.txt","w")) && (dict = caption_dicts[2])
+          unique_ids = Dict{Int,Bool}();
+          limit = o[:capnumber]
+          for item in shuffle(dict)
+              get!(unique_ids,item[1][1],true)
+              (length(unique_ids)==limit) && break;
+          end
+          for (id,_) in unique_ids
+             generate(model,initstate(model, 1), id, vocab, o[:generate], o[:beam_width]);
+          end
+          close(out); close(in_out)
+      end
+   end
+
+   if o[:feature]
+     println("extracting image features for all dataset for once")
+     if o[:flickr]
+       extract_features(caption_dicts[1],  "./data/Flickr30k/","feats2", "");
+     elseif o[:coco]
+       extract_features(caption_dicts[1], "./data/MsCoCo/train2014/","train_feats", "COCO_train2014_");
+       extract_features(caption_dicts[1], "./data/MsCoCo/val2014/","val_feats","COCO_val2014_");
+     end
+     println("image features extracted")
+     return;
+   end
 
   if !isempty(caption_dicts)
     println("Batching starts")
-    if o[:feature]
-      println("extracting image features for all dataset for once")
-      #extract_features(caption_dicts[1],  "./data/Flickr30k/","feats2", "");
-      #extract_features(caption_dicts[1], "./data/MsCoCo/train2014/","train_feats", "COCO_train2014_");
-      #extract_features(caption_dicts[1], "./data/MsCoCo/val2014/","val_feats","COCO_val2014_");
-      return;
-      println("image features extracted")
-    end
     sequence = map(t->minibatch(t, vocab, o[:batchsize]), caption_dicts)
     caption_dicts = 0; gc();
     println("Batching finished")
@@ -184,22 +205,28 @@ end
 
 function train!(model, optim, sequence, vocab, o)
     s0 = initstate(model, o[:batchsize])
-    if o[:fast]
+    if o[:train]
          for epoch=1:o[:epochs]
                train1(model, optim, s0, sequence[1]; batch_size=o[:batchsize], lr=o[:lr], gclip=o[:gclip], cnnout=o[:cnnout], pdrop=0.7)
                if o[:savefile] != nothing
                    info("Saving last model to $(o[:savefile])")
                    save(o[:savefile], "model", model, "vocab", vocab)
                end
-               losses = map(d->average_loss(model, d ; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0), sequence)
+               losses = zeros(Float32, 2);
+               losses[1] = average_loss(model, sequence[1],feats; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0)
+               losses[2] = average_loss(model, sequence[2], featsvl; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0)
+               #losses = map(d->average_loss(model, d ; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0), sequence)
                println((:epoch,epoch,:loss,losses...))
-               datasheet = open("e1000_h1000_p_0.7.out","a+");
+               datasheet = open("cooco_e1000_h1000_p_0.0.out","a+");
                println(datasheet,(:epoch,epoch,:loss,losses...));
                close(datasheet);
           end
            gpu()>=0 && Knet.cudaDeviceSynchronize()
         return
-    end
+    else
+
+    losses = map(d->average_loss(model, d ; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0), sequence)
+    println((:epoch,epoch,:loss,losses...))
 end
 
 function initeosbos(batch_size;atype=KnetArray{Float32})
@@ -358,7 +385,7 @@ function initparams(model)
   return prms
 end
 
-function average_loss(param, seq; batch_size=20, cnnout=4096, atype=KnetArray{Float32}, pdrop=0.0)
+function average_loss(param, seq, featsms; batch_size=20, cnnout=4096, atype=KnetArray{Float32}, pdrop=0.0)
 
   sequence = seq[1]
   input_ids = seq[2]
@@ -400,7 +427,7 @@ function average_loss(param, seq; batch_size=20, cnnout=4096, atype=KnetArray{Fl
      #println("length of the senteces in the batch: ", l);
      for i=1:batch_size
            id = input_ids[input_index][i]
-           feature_index = get(feats,id,nothing)
+           feature_index = get(featsms,id,nothing)
            input[i,:] = convert(atype,feature_index);
      end
 
@@ -530,15 +557,13 @@ end
 
 lossgradient = grad(loss);
 
-function generate(param, state, input, vocab, nword, beam_width)
-    println("Generating Starts:");
+function generate(param, state, input, vocab, nword, beam_width; out=STDOUT, in_out=STDOUT)
+    print("Generating Starts:");
     #Create index to word array
     index_to_char = Array(String, length(vocab))
     for (k,v) in vocab; index_to_char[v] = k; end
-
     #Initialize eos, bos and unk tokens for batchsize 1.
     initeosbos(1)
-
     if typeof(input) != Int
       # Get CNN features with convnet
       input = convnet(input);
@@ -546,30 +571,32 @@ function generate(param, state, input, vocab, nword, beam_width)
       input = input/sum(input);
     else
       #Loading from existing features
-      println(input,":")
+      println(in_out,input)
       input = get(feats,input,nothing);
-      if input == nothing
-            return;
-      end
+      (input == nothing) && return;
       input = convert(KnetArray,reshape(input,1,4096));
     end
-
     #Beginning of sentence is multiplied by embedding matrix
     lstm_input = param[end-2][bos,:];
     #CNN output for the batch of sentences is multiplied with one parameter
     input = input * param[end-3];
-    #
-    xs = Array{Tuple{Array{Int,1},Float32},1}();
+
+    word_indices = Array{Tuple{Array{Int,1},Float32},1}();
     states = Array{typeof(state),1}();
     for i=1:beam_width
         push!(xs,(bos,1.0))
         push!(states,copy(state))
     end
-    xp = beam_search(xs,states, input, param, nword,1)
-    for i=1:length(xp[1][1])
-        print(index_to_char[xp[1][1][i]], " ");
+    #Select most probable sequence in the beam
+    word_indices = beam_search(word_indices,states, input, param, nword,1)[1][1]
+    for i=2:length(word_indices)-1
+        if i != length(word_indices)-1
+           print(out,index_to_char[word_indices[i]], " ");
+        elseif  word_indices[i] != 1
+           print(out,index_to_char[word_indices[i]], " ");
+        else
+           print(out,".\n")
     end
-    println()
     println("Generating Done")
 end
 
@@ -599,7 +626,7 @@ function beam_search(x,states,input,param,nword,current)
   sorted = sortperm(new_x, by = tuple -> last(tuple), rev=true)
   xs = new_x[sorted[1:length(x)]];
   #println(xs)
-  if current>nword ##eos
+  if xs[1][1][end]==1 || current>nword ##eos
     return xs;
   end
   new_states = similar(states);
