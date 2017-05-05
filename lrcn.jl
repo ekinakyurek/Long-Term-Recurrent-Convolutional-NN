@@ -70,7 +70,7 @@ function main(args=ARGS)
     isempty(o[:datafiles]) && (o[:flickr] && push!(o[:datafiles],Flickr30k_captions))
     isempty(o[:datafiles]) && (o[:coco] && push!(o[:datafiles],MsCoCo_captions, MsCoCo_validation))
 
-    gpu()>=0 && KnetArray(Float32,1) * KnetArray(Float32,1); #To initialize cudablas
+    gpu()>=0 && (KnetArray(Float32,1,1) * KnetArray(Float32,1,1)) #To initialize cudablas
     global batchsize = o[:batchsize];
 
     if !isempty(o[:datafiles])
@@ -93,7 +93,7 @@ function main(args=ARGS)
       global vocab = load(o[:loadfile], "vocab")
       global vocab_size = length(vocab);
     end
-    if[:train]
+    if o[:train]
       optim = initparams(model);
     end
     println("LSTM is initialized")
@@ -114,38 +114,54 @@ function main(args=ARGS)
       global convnet = get_convnet(params...);
       global averageImage = convert(Array{Float32},vgg["meta"]["normalization"]["averageImage"])
       println("Cnn is initialized")
-    end
+  end
 
 
-    if[:train]
+
+    if o[:train] || (o[:generate]>0 && !o[:cnn])
       println("Loading existing features to train")
       o[:flickr] && (global feats = load("./data/Flickr30k/featsn.jld", "features"))
-      o[:coco] && global feats = load("./data/MsCoCo/train2014/train_featsn.jld","features");
-      o[:coco] && global featsvl = load("./data/MsCoCo/val2014/val_featsn.jld", "features");
+      o[:coco] && (global feats = load("./data/MsCoCo/train2014/train_featsn.jld","features"));
+      o[:coco] && (global featsvl = load("./data/MsCoCo/val2014/val_featsn.jld", "features"));
       println("Features loaded")
     end
 
     if o[:generate] > 0
       if o[:cnn]
           image = read_image_data(o[:image], averageImage)
-          generate(model,initstate(model,1), image, vocab, o[:generate], o[:beam_width])
+          generate(model,initstate(model,1), image, vocab, o[:generate], o[:beam_width], nothing)
       else
-          o[:flickr] && (out = open("candidates_flickr.txt","w")) && (in_out = open("candidate_ids_flickr.txt","w")) && (dict = caption_dicts[3])
-          o[:coco] && (out = open("candidates_coco.txt","w")) && (in_out = open("candidate_ids_coco.txt","w")) && (dict = caption_dicts[2])
+          if o[:flickr]
+            out = open("./eval/candidates_flickr","w")
+            in_out = open("./eval/candidate_ids_flickr","w")
+            dict = caption_dicts[3];
+          end
+         if o[:coco]
+            out = open("./eval/candidates.txt","w")
+            in_out = open("./eval/candidate_ids.txt","w")
+            dict = caption_dicts[2];
+        end
           unique_ids = Dict{Int,Bool}();
           limit = o[:capnumber]
+
           for item in shuffle(dict)
               get!(unique_ids,item[1][1],true)
-              (length(unique_ids)==limit) && break;
+              if length(unique_ids)==limit
+                 break
+              end
           end
+
           for (id,_) in unique_ids
-             generate(model,initstate(model, 1), id, vocab, o[:generate], o[:beam_width]);
+              o[:flickr] && generate(model,initstate(model, 1), id, vocab, o[:generate], o[:beam_width],feats; out=out, in_out=in_out);
+              o[:coco] && generate(model,initstate(model, 1), id, vocab, o[:generate], o[:beam_width], featsvl; out=out, in_out=in_out);
           end
-          close(out); close(in_out)
+          close(out);
+          close(in_out);
       end
+      return;
    end
 
-   if o[:feature]
+   if o[:extfeatures]
      println("extracting image features for all dataset for once")
      if o[:flickr]
        extract_features(caption_dicts[1],  "./data/Flickr30k/","feats2", "");
@@ -223,8 +239,7 @@ function train!(model, optim, sequence, vocab, o)
           end
            gpu()>=0 && Knet.cudaDeviceSynchronize()
         return
-    else
-
+    end
     losses = map(d->average_loss(model, d ; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0), sequence)
     println((:epoch,epoch,:loss,losses...))
 end
@@ -386,7 +401,6 @@ function initparams(model)
 end
 
 function average_loss(param, seq, featsms; batch_size=20, cnnout=4096, atype=KnetArray{Float32}, pdrop=0.0)
-
   sequence = seq[1]
   input_ids = seq[2]
   lengths = seq[3]
@@ -557,7 +571,7 @@ end
 
 lossgradient = grad(loss);
 
-function generate(param, state, input, vocab, nword, beam_width; out=STDOUT, in_out=STDOUT)
+function generate(param, state, input, vocab, nword, beam_width, val_feats; out=STDOUT, in_out=STDOUT)
     print("Generating Starts:");
     #Create index to word array
     index_to_char = Array(String, length(vocab))
@@ -572,8 +586,11 @@ function generate(param, state, input, vocab, nword, beam_width; out=STDOUT, in_
     else
       #Loading from existing features
       println(in_out,input)
-      input = get(feats,input,nothing);
-      (input == nothing) && return;
+      input = get(val_feats,input,nothing);
+      if input == nothing
+          error("misssing features!!!!!!")
+          return;
+      end
       input = convert(KnetArray,reshape(input,1,4096));
     end
     #Beginning of sentence is multiplied by embedding matrix
@@ -584,19 +601,19 @@ function generate(param, state, input, vocab, nword, beam_width; out=STDOUT, in_
     word_indices = Array{Tuple{Array{Int,1},Float32},1}();
     states = Array{typeof(state),1}();
     for i=1:beam_width
-        push!(xs,(bos,1.0))
+        push!(word_indices,(bos,1.0))
         push!(states,copy(state))
     end
     #Select most probable sequence in the beam
-    word_indices = beam_search(word_indices,states, input, param, nword,1)[1][1]
-    for i=2:length(word_indices)-1
-        if i != length(word_indices)-1
-           print(out,index_to_char[word_indices[i]], " ");
-        elseif  word_indices[i] != 1
-           print(out,index_to_char[word_indices[i]], " ");
-        else
-           print(out,".\n")
+    word_indices = beam_search(word_indices,states, input, param, nword,1)
+    word_indices = word_indices[1][1]
+    for i=2:length(word_indices)
+       if word_indices[i] == eos[1]
+           break
+       end
+       print(out,index_to_char[word_indices[i]], " ");
     end
+    println(out,".");
     println("Generating Done")
 end
 
@@ -626,7 +643,7 @@ function beam_search(x,states,input,param,nword,current)
   sorted = sortperm(new_x, by = tuple -> last(tuple), rev=true)
   xs = new_x[sorted[1:length(x)]];
   #println(xs)
-  if xs[1][1][end]==1 || current>nword ##eos
+  if xs[1][1][end]==eos[1] || current>nword ##eos
     return xs;
   end
   new_states = similar(states);

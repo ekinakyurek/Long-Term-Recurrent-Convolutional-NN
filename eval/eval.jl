@@ -1,10 +1,10 @@
 #MSCOCO 2014
 using JSON
-file = open("candidate_ids.txt");
+file = open("ids_coco_bm4");
 candidate_ids = readlines(file);
 candidate_ids = map(p->parse(Int,p), candidate_ids)
 
-file = open("../data/MsCoCO/captions_val2014.json");
+file = open("../data/MsCoCo/captions_val2014.json");
 captions = JSON.parse(file);
 annotations = captions["annotations"];
 
@@ -22,7 +22,7 @@ end
 
 refs = Any[]
 for i=0:4
-  push!(refs, open("ref$(i)","w"))
+  push!(refs, open("./coco_refs/ref$(i)","w"))
 end
 
 for id in candidate_ids
@@ -34,9 +34,9 @@ end
 
 map(p->close(p),refs);
 println("MSCOCO Scores")
-run(pipeline(`perl multi-bleu.perl ref`, stdin="candidates.txt"))
+run(pipeline(`perl multi-bleu.perl ./coco_refs/ref`, stdin="caps_coco_bm4"))
 #Flickr30k
-file = open("candidate_ids_f.txt");
+file = open("candidate_ids_flickr");
 candidate_ids = readlines(file);
 candidate_ids = map(p->parse(Int,p), candidate_ids)
 
@@ -58,7 +58,7 @@ end
 
 refs = Any[]
 for i=0:4
-  push!(refs, open("f_ref$(i)","w"))
+  push!(refs, open("./flickr_refs/f_ref$(i)","w"))
 end
 
 for id in candidate_ids
@@ -74,7 +74,7 @@ end
 map(p->close(p),refs);
 
 println("Flickr30k Scores")
-run(pipeline(`perl multi-bleu.perl f_ref`, stdin="candidates_f.txt"))
+run(pipeline(`perl multi-bleu.perl ./flickr_refs/f_ref`, stdin="candidates_flickr"))
 
 #run(`perl multi-bleu.perl f_ref < candidates_f.txt`)
 #run(`perl multi-bleu.perl ref < candidates.txt`)
