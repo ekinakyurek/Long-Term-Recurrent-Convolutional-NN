@@ -37,7 +37,7 @@ function main(args=ARGS)
         ("--savefile"; help="Save final model to file")
         ("--bestfile"; help="Save best model to file")
         ("--generate"; arg_type=Int; default=0; help="If non-zero generate given number of characters.")
-        ("--hidden"; nargs='+'; arg_type=Int; default=[700, 700]; help="Sizes of one or more LSTM layers.")
+        ("--hidden"; nargs='+'; arg_type=Int; default=[750, 750]; help="Sizes of one or more LSTM layers.")
         ("--embed"; arg_type=Int; default=750; help="Size of the embedding vector.")
         ("--cnnout"; arg_type=Int; default=4096; help="Size of the cnn visual output vector.");
         ("--epochs"; arg_type=Int; default=5; help="Number of epochs for training.")
@@ -167,7 +167,7 @@ function main(args=ARGS)
        extract_features(caption_dicts[1],  "./data/Flickr30k/","feats2", "");
      elseif o[:coco]
        extract_features(caption_dicts[1], "./data/MsCoCo/train2014/","train_feats", "COCO_train2014_");
-       #extract_features(caption_dicts[2], "./data/MsCoCo/val2014/","val_feats","COCO_val2014_");
+       extract_features(caption_dicts[1], "./data/MsCoCo/val2014/","val_feats","COCO_val2014_");
      end
      println("image features extracted")
      return;
@@ -190,8 +190,8 @@ function main(args=ARGS)
 end
 
 function extract_features(seq, dataset,filename, header)
-  #feats = Dict{Int,Array{Float32,2}}();
-  feats =   load("$(dataset)$(filename).jld", "features"); gc();
+  feats = Dict{Int,Array{Float32,2}}();
+  #feats =   load("$(dataset)$(filename).jld", "features", feats); gc();
   ids = Dict{Int,Int}();
   for t=1:length(seq)
       get!(ids,seq[t][1][1],length(ids)+1)
@@ -201,21 +201,18 @@ function extract_features(seq, dataset,filename, header)
   println(l);
   prefix = dataset*header
   k=1;
-  for id in ids
-       if !haskey(feats,id)
-        println(id)
-        image = read_image_data(prefix*dec(id,12)*".jpg", averageImage)
-        image = convnet(image);
-        feats[id] = convert(Array{Float32}, image)
-       end
+  @inbounds for id in ids
+      image = read_image_data(prefix*dec(id,12)*".jpg", averageImage)
+      image = convnet(image);
+      feats[id] = convert(Array{Float32}, image)
 
       if k%1000 == 1
             println(length(feats));
       end
-    #  if k%10000 == 1
-            #save(dataset*filename*".jld", "features", feats);
-            #println(length(feats), ". image saved");
-      #end
+      if k%10000 == 1
+            save(dataset*filename*".jld", "features", feats);
+            println(length(feats), ". image saved");
+     end
      k+=1;
   end
   println("It is finished. I do last saving")
@@ -236,7 +233,7 @@ function train!(model, optim, sequence, vocab, o)
                losses[2] = average_loss(model, sequence[2], featsvl; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0)
                #losses = map(d->average_loss(model, d ; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0), sequence)
                println((:epoch,epoch,:loss,losses...))
-               datasheet = open("coco_e750_h700700_p_0.0.out","a+");
+               datasheet = open("cooco_e1000_h1000_p_0.0.out","a+");
                println(datasheet,(:epoch,epoch,:loss,losses...));
                close(datasheet);
           end
@@ -371,9 +368,6 @@ function train1(param, optim, state, seq; batch_size=20, lr=2.0, gclip=0.0, cnno
     for i=1:batch_size
            id = input_ids[input_index][i]
            feature_index = get(feats,id,nothing)
-           if feature_index == nothing
-             println(id)
-           end
            input[i,:] = convert(atype,feature_index);
     end
     #input = convert(KnetArray{Float32},input);

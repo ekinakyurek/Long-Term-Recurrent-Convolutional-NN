@@ -1,6 +1,7 @@
 #MSCOCO 2014
 using JSON
-file = open("ids_coco_bm4");
+#file = open("ids_coco_bm4");
+file = open("candidate_ids.txt");
 candidate_ids = readlines(file);
 candidate_ids = map(p->parse(Int,p), candidate_ids)
 
@@ -34,7 +35,7 @@ end
 
 map(p->close(p),refs);
 println("MSCOCO Scores")
-run(pipeline(`perl multi-bleu.perl ./coco_refs/ref`, stdin="caps_coco_bm4"))
+run(pipeline(`perl multi-bleu.perl ./coco_refs/ref`, stdin="candidates.txt"))
 #Flickr30k
 file = open("candidate_ids_flickr");
 candidate_ids = readlines(file);
