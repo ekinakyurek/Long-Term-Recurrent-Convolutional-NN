@@ -25,32 +25,34 @@ const Flickr30k_captions = "data/Flickr30k/results_20130124.token"
 const MsCoCo_captions = "data/MsCoCo/captions_train2014.json"
 const MsCoCo_validation = "data/MsCoCo/captions_val2014.json"
 const LAYER_TYPES = ["conv", "relu", "pool", "fc", "prob"]
-const cnnout = 4096;
+
 function main(args=ARGS)
     s = ArgParseSettings()
     s.description = "LRCN.jl (c) Ekin Akyürek, 2017. Long-term Recurrent Convolutional Networks for Visual Recognition and Description"
     @add_arg_table s begin
-        ("image"        ; default=imgurl; help="Image file or URL.")
-        ("--model"      ; default=Knet.dir("data","imagenet-vgg-verydeep-16.mat"); help="Location of the model file")
-        ("--datafiles"  ; nargs='+'; help="If provided, use first file for training, second for dev, others for test.")
-        ("--loadfile"   ; help="Initialize model from file")
-        ("--savefile"   ; help="Save final model to file")
-        ("--generate"   ; arg_type=Int; default=0; help="If non-zero generate given number of characters.")
-        ("--hidden"     ; nargs='+'; arg_type=Int; default=[1000,1000]; help="Sizes of one or more LSTM layers.")
-        ("--embed"      ; arg_type=Int; default=1000; help="Size of the embedding vector.")
-        ("--epochs"     ; arg_type=Int; default=10; help="Number of epochs for training.")
-        ("--capnumber"  ; arg_type=Int; default=1000; help="Number of captions will be generated.")
-        ("--batchsize"  ; arg_type=Int; default=25; help="Number of senteces to train on in parallel.")
-        ("--lr"         ; arg_type=Float64; default=0.1; help="Initial learning rate.")
-        ("--gclip"      ; arg_type=Float64; default=5.0; help="Value to clip the gradient norm at.")
-        ("--seed"       ; arg_type=Int; default=-1; help="Random number seed.")
-        ("--atype"      ; default=(gpu()>=0 ? "KnetArray{Float32}" : "Array{Float32}"); help="array type: Array for cpu, KnetArray for gpu")
-        ("--train"      ; action=:store_true; help="skip loss printing for faster run")
-        ("--cnn"        ; action=:store_true; help="loads cnn weights")
+        ("image"; default=imgurl; help="Image file or URL.")
+        ("--model"; default=Knet.dir("data","imagenet-vgg-verydeep-16.mat"); help="Location of the model file")
+        ("--datafiles"; nargs='+'; help="If provided, use first file for training, second for dev, others for test.")
+        ("--loadfile"; help="Initialize model from file")
+        ("--savefile"; help="Save final model to file")
+        ("--bestfile"; help="Save best model to file")
+        ("--generate"; arg_type=Int; default=0; help="If non-zero generate given number of characters.")
+        ("--hidden"; nargs='+'; arg_type=Int; default=[700, 750]; help="Sizes of one or more LSTM layers.")
+        ("--embed"; arg_type=Int; default=750; help="Size of the embedding vector.")
+        ("--cnnout"; arg_type=Int; default=4096; help="Size of the cnn visual output vector.");
+        ("--epochs"; arg_type=Int; default=10; help="Number of epochs for training.")
+        ("--capnumber"; arg_type=Int; default=1000; help="Number of captions will be generated.")
+        ("--batchsize"; arg_type=Int; default=50; help="Number of senteces to train on in parallel.")
+        ("--lr"; arg_type=Float64; default=0.1; help="Initial learning rate.")
+        ("--gclip"; arg_type=Float64; default=5.0; help="Value to clip the gradient norm at.")
+        ("--seed"; arg_type=Int; default=-1; help="Random number seed.")
+        ("--atype"; default=(gpu()>=0 ? "KnetArray{Float32}" : "Array{Float32}"); help="array type: Array for cpu, KnetArray for gpu")
+        ("--train"; action=:store_true; help="skip loss printing for faster run")
+        ("--cnn"; action=:store_true; help="loads cnn weights")
         ("--extfeatures";action=:store_true; help="extract features")
-        ("--flickr"     ;action=:store_true; help="works on flickr30k dataset")
-        ("--coco"       ;action=:store_true; help="works on mscoco 2014 dataset")
-        ("--beam_width" ;arg_type=Int;default=3;help="width of beam search")
+        ("--flickr";action=:store_true; help="works on flickr30k dataset")
+        ("--coco";action=:store_true; help="works on mscoco 2014 dataset")
+        ("--beam_width";arg_type=Int;default=3;help="width of beam search")
         #TODO ("--dropout"; arg_type=Float64; default=0.0; help="Dropout probability.")
     end
     println(s.description)
@@ -84,7 +86,7 @@ function main(args=ARGS)
 
     println("Intializing LSTM weigths")
     if o[:loadfile]==nothing
-      model = initweights(o[:atype], o[:hidden], vocab_size, o[:embed])
+      model = initweights(o[:atype], o[:hidden], vocab_size, o[:embed], o[:cnnout])
     else
       info("Loading model from $(o[:loadfile])")
       model = map(p->convert(o[:atype],p), load(o[:loadfile], "model"))
@@ -119,8 +121,8 @@ function main(args=ARGS)
     if o[:train] || (o[:generate]>0 && !o[:cnn])
       println("Loading existing features to train")
       o[:flickr] && (global feats = load("./data/Flickr30k/featsn.jld", "features"))
-      o[:coco]   && (global feats = load("./data/MsCoCo/train2014/train_featsn.jld","features"));
-      o[:coco]   && (global featsvl = load("./data/MsCoCo/val2014/val_featsn.jld", "features"));
+      o[:coco] && (global feats = load("./data/MsCoCo/train2014/train_featsn.jld","features"));
+      o[:coco] && (global featsvl = load("./data/MsCoCo/val2014/val_featsn.jld", "features"));
       println("Features loaded")
     end
 
@@ -224,24 +226,24 @@ function train!(model, optim, sequence, vocab, o)
     s0 = initstate(model, o[:batchsize])
     if o[:train]
          for epoch=1:o[:epochs]
-               train1(model, optim, s0, sequence[1]; batch_size=o[:batchsize], lr=o[:lr], gclip=o[:gclip], pdrop=0.4)
+               train1(model, optim, s0, sequence[1]; batch_size=o[:batchsize], lr=o[:lr], gclip=o[:gclip], cnnout=o[:cnnout], pdrop=0.4)
                if o[:savefile] != nothing
                    info("Saving last model to $(o[:savefile])")
                    save(o[:savefile], "model", model, "vocab", vocab)
                end
                losses = zeros(Float32, 2);
-               losses[1] = average_loss(model, sequence[1],feats; batch_size=o[:batchsize], pdrop=0.0)
-               losses[2] = average_loss(model, sequence[2], featsvl; batch_size=o[:batchsize], pdrop=0.0)
+               losses[1] = average_loss(model, sequence[1],feats; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0)
+               losses[2] = average_loss(model, sequence[2], featsvl; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0)
                #losses = map(d->average_loss(model, d ; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0), sequence)
                println((:epoch,epoch,:loss,losses...))
-               datasheet = open("coco_e750_h700750_p_0.0.out","a+");
+               datasheet = open("coco_e750_h700700_p_0.0.out","a+");
                println(datasheet,(:epoch,epoch,:loss,losses...));
                close(datasheet);
           end
            gpu()>=0 && Knet.cudaDeviceSynchronize()
         return
     end
-    losses = map(d->average_loss(model, d ; batch_size=o[:batchsize], pdrop=0.0), sequence)
+    losses = map(d->average_loss(model, d ; batch_size=o[:batchsize], cnnout=o[:cnnout], pdrop=0.0), sequence)
     println((:epoch,epoch,:loss,losses...))
 end
 
@@ -327,7 +329,7 @@ function delete_unbatchable_captions!(caption_dict,batch_size)
 end
 
 
-function train1(param, optim, state, seq; batch_size=20, lr=2.0, gclip=0.0, pdrop=0.0, atype=KnetArray{Float32})
+function train1(param, optim, state, seq; batch_size=20, lr=2.0, gclip=0.0, cnnout=4096, pdrop=0.0, atype=KnetArray{Float32})
   Knet.gc(); gc();
   sequence = seq[1];input_ids = seq[2];lengths = seq[3]
 
@@ -404,7 +406,7 @@ function initparams(model)
   return prms
 end
 
-function average_loss(param, seq, featsms; batch_size=20, atype=KnetArray{Float32}, pdrop=0.0)
+function average_loss(param, seq, featsms; batch_size=20, cnnout=4096, atype=KnetArray{Float32}, pdrop=0.0)
   sequence = seq[1]
   input_ids = seq[2]
   lengths = seq[3]
@@ -486,26 +488,23 @@ function average_loss(param, seq, featsms; batch_size=20, atype=KnetArray{Float3
 end
 
 
-function initweights(atype, hidden, vocab, embed)
+function initweights(atype, hidden, vocab, embed, cnnout)
   init(d...)=atype(xavier(d...))
   bias(d...)=atype(zeros(d...))
   model = Array(Any, 2*length(hidden)+5)
   X = embed
   for k = 1:length(hidden)
     H = hidden[k]
-    if k==2
-        X = hidden[end]
-    end
-    model[2k-1]    = init(X+H, 4H)
-    model[2k]      = bias(1, 4H)
+    model[2k-1] = init(X+H, 4H)
+    model[2k] = bias(1, 4H)
     model[2k][1:H] = 1 # forget gate bias = 1
     X = H
   end
-  model[end-4] = init(hidden[end-1],ceil(Int,hidden[end]/2))
+  model[end-4] = init(hidden[end],ceil(Int,hidden[end]/2))
   model[end-3] = init(cnnout,ceil(Int,hidden[end]/2))
   model[end-2] = init(vocab,embed)
   model[end-1] = init(hidden[end],vocab)
-  model[end]   = bias(1,vocab)
+  model[end] = bias(1,vocab)
   return model;
 end
 
@@ -538,16 +537,16 @@ function lstm(weight,bias,hidden,cell,input)
 end
 
 function lrcn(w, s, x_cnn, x_lstm; pdrop=0.0)
-    x = x_lstm;
-    x = dropout(x,pdrop);
-    s[1],s[2] = lstm(w[1],w[2],s[1],s[2],x);
-    x = s[1];
-    x = x * w[end-4];
-    x = hcat(x,x_cnn);
-    x = dropout(x,pdrop);
-    s[3],s[4] = lstm(w[3],w[4],s[3],s[4],x);
-    x = s[3];
-    return x * w[end-1] .+ w[end]
+  x = x_lstm;
+  x = dropout(x,pdrop);
+  s[1],s[2] = lstm(w[1],w[2],s[1],s[2],x);
+  x = s[1];
+  x = x * w[end-4];
+  x = hcat(x,x_cnn);
+  x = dropout(x,pdrop);
+  s[3],s[4] = lstm(w[3],w[4],s[3],s[4],x);
+  x = s[3];
+  return x * w[end-1] .+ w[end]
 end
 
 function loss(param,state,input,sequence,range; pdrop=0.0)
@@ -557,7 +556,7 @@ function loss(param,state,input,sequence,range; pdrop=0.0)
     #CNN output for the batch of sentences is multiplied with one parameter
     input = input * param[end-3];
     #Training starts for all words
-    for t in range
+   for t in range
         ypred = lrcn(param,state,input,lstm_input;pdrop=pdrop)
         ynorm = logp(ypred,2) # ypred .- log(sum(exp(ypred),2))
         index = similar(sequence[t])
@@ -585,11 +584,10 @@ lossgradient = grad(loss);
 function generate(param, state, input, vocab, nword, beam_width, val_feats; out=STDOUT, in_out=STDOUT)
     print("Generating Starts:");
     #Create index to word array
-    initeosbos(1)
     index_to_char = Array(String, length(vocab))
     for (k,v) in vocab; index_to_char[v] = k; end
     #Initialize eos, bos and unk tokens for batchsize 1.
-
+    initeosbos(1)
     if typeof(input) != Int
       # Get CNN features with convnet
       input = convnet(input);
@@ -603,24 +601,12 @@ function generate(param, state, input, vocab, nword, beam_width, val_feats; out=
           error("misssing features!!!!!!")
           return;
       end
-      input = convert(KnetArray,reshape(input,1,cnnout));
+      input = convert(KnetArray,reshape(input,1,4096));
     end
     #Beginning of sentence is multiplied by embedding matrix
     lstm_input = param[end-2][bos,:];
     #CNN output for the batch of sentences is multiplied with one parameter
     input = input * param[end-3];
-
-    # for i=1:nword
-    #     ypred = lrcn(param,copy(state),input,lstm_input)
-    #     ynorm = exp(logp(ypred,2));
-    #     index = sample(ynorm,100)
-    #     lstm_input = param[end-2][[index],:];
-    #     if index == eos[1]
-    #      break;
-    #    end
-    #    print(out,index_to_char[index], " ");
-    # end
-    # println(out, ".");
 
     word_indices = Array{Tuple{Array{Int,1},Float32},1}();
     states = Array{typeof(state),1}();
@@ -685,13 +671,6 @@ function sample(p)
         r < 0 && return c
     end
 end
-
-function sample(p,N)
-    indices = randperm(length(p))[1:N]
-    p = convert(Array,p)
-    return findmax(p[indices])[2]
-end
-
 
 #CNN Parameters from VLFEAT VGG.NET
 function get_params_cnn(CNN; last_layer="fc7")
